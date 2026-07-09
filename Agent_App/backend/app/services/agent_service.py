@@ -329,6 +329,25 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
     test_tokens = ["test", "junit", "测试"]
     run_tokens = ["run", "execute", "运行", "执行", "跑"]
     diagnose_tokens = ["diagnose", "check", "诊断", "检查", "编译一下", "跑一下"]
+    file_info_tokens = [
+        "fqn",
+        "fnq",
+        "fully qualified",
+        "qualified name",
+        "全限定名",
+        "完整类名",
+        "包名",
+        "类名",
+        "imports",
+        "import",
+        "导入",
+        "依赖",
+        "方法",
+        "method",
+        "methods",
+        "结构",
+        "分析",
+    ]
 
     is_question = any(token in lower for token in question_tokens)
     wants_test = any(token in lower for token in test_tokens)
@@ -337,7 +356,12 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
     wants_run = any(token in lower for token in run_tokens)
     wants_diagnose = any(token in lower for token in diagnose_tokens)
 
-    if any(token in lower for token in explain_tokens) and wants_test:
+    wants_file_info = bool(file_id) and any(token in lower for token in file_info_tokens)
+
+    if wants_file_info and not (wants_generate or wants_run):
+        intent = "describe_current_file"
+        mode = "read"
+    elif any(token in lower for token in explain_tokens) and wants_test:
         intent = "explain_latest_test"
         mode = "read"
     elif wants_batch and wants_generate and wants_test:
@@ -367,7 +391,7 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
         intent = "list_artifacts"
         mode = "read"
     elif any(token in lower for token in ["analyze", "method", "分析", "方法"]):
-        intent = "analyze_file" if not is_question else "chat"
+        intent = "analyze_file" if file_id else "chat"
         mode = "read" if intent == "analyze_file" else "ask"
     elif any(token in lower for token in ["remember", "记住"]):
         intent = "remember"
@@ -379,11 +403,12 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
         "repair_latest": "Repair the latest generated test artifact for the active Java file.",
         "diagnose_latest": "Run a compile/diagnosis action for the latest generated test artifact.",
         "generate_tests": "Generate one JUnit 4 test artifact for the active Java file.",
+        "describe_current_file": "Read the active Java file analysis and answer structural questions such as FQN, package, imports, and methods.",
         "explain_latest_test": "Explain what the latest generated JUnit test is testing. This is read-only.",
         "list_artifacts": "List generated artifacts for the active Java file. This is read-only.",
         "analyze_file": "Analyze the active Java file structure. This is read-only.",
         "remember": "Store a stable user preference or project fact.",
-        "chat": "Answer in Chinese without executing tools or changing state.",
+        "chat": "Answer in Chinese without changing state. Read-only tools are allowed only when the intent is normalized to read mode.",
     }
     return {
         "raw": message,
@@ -401,13 +426,54 @@ def ask_mode_reply(message: str, file_id: str | None) -> str:
     lower = message.lower()
     if any(token in lower for token in ["coverage", "jacoco", "覆盖率", "import", "依赖"]):
         return (
-            "这是 Ask mode，我不会自动生成、修复或运行覆盖率任务。\n"
+            "这是 Ask mode，我不会自动生成、修复或运行覆盖率这类会改变状态或明显消耗资源的任务。\n"
+            "但只读查询可以调用工具，例如读取当前 Java 文件分析、展示 FQN、imports、方法列表或历史 artifact。\n"
             "对真实 Java 项目来说，单个 .java 文件往往不足以编译：import 可能来自 Maven/Gradle 依赖、同项目其他源码或 lib jar。\n"
             "如果要获得可信的编译和 JaCoCo 覆盖率，应上传整个 Maven/Gradle 项目 zip 或文件夹；我会保留 Java 文件列表，你仍可以选择单个或部分文件生成测试。"
         )
     return (
-        "这是 Ask mode，我只回答问题，不会自动执行生成、修复、运行覆盖率或删除等会改变状态的任务。\n"
-        "如果你要我真的执行，请用明确动作词，例如：“生成当前文件测试”、“运行覆盖率”、“修复最新测试”。"
+        "这是 Ask mode，我不会自动执行生成、修复、运行覆盖率或删除等会改变状态的任务。\n"
+        "只读问题可以读取当前文件或 artifact 信息来回答；如果你要我执行副作用动作，请用明确动作词，例如：“生成当前文件测试”、“运行覆盖率”、“修复最新测试”。"
+    )
+
+
+def describe_current_file_reply(message: str, analysis: dict[str, Any]) -> str:
+    lower = message.lower()
+    package_name = analysis.get("package") or ""
+    class_name = analysis.get("class_name") or Path(str(analysis.get("file_name") or "Unknown.java")).stem
+    fqn = f"{package_name}.{class_name}" if package_name else class_name
+    relative_path = analysis.get("_project_relative_path") or analysis.get("file_name") or ""
+
+    if any(token in lower for token in ["fqn", "fnq", "fully qualified", "qualified name", "全限定名", "完整类名"]):
+        note = "你说的 FNQ 我按 FQN（Fully Qualified Name，全限定类名）理解。" if "fnq" in lower else "当前类的 FQN 如下。"
+        return f"{note}\n\n- FQN：`{fqn}`\n- package：`{package_name or '<default package>'}`\n- class：`{class_name}`"
+
+    if any(token in lower for token in ["imports", "import", "导入", "依赖"]):
+        imports = analysis.get("imports") or []
+        dependency_hints = analysis.get("dependency_hints") or []
+        import_text = "\n".join(f"- `{item}`" for item in imports[:30]) or "- 当前文件没有显式 import。"
+        hint_text = "\n".join(f"- `{item}`" for item in dependency_hints[:20]) or "- 未识别到额外的大写类名依赖提示。"
+        return f"当前文件 `{relative_path}` 的导入信息：\n\nimports:\n{import_text}\n\n依赖提示:\n{hint_text}"
+
+    if any(token in lower for token in ["方法", "method", "methods"]):
+        methods = analysis.get("methods") or []
+        if not methods:
+            return f"当前类 `{fqn}` 暂未从源码中识别到方法。"
+        lines = []
+        for method in methods[:30]:
+            params = method.get("parameters") or ""
+            return_type = method.get("return_type") or ""
+            lines.append(f"- `{method.get('name')}({params})` -> `{return_type}`，line {method.get('line')}")
+        return f"当前类 `{fqn}` 识别到 {analysis.get('method_count', len(methods))} 个方法：\n" + "\n".join(lines)
+
+    return (
+        f"当前 Java 文件结构如下：\n\n"
+        f"- 文件：`{relative_path}`\n"
+        f"- FQN：`{fqn}`\n"
+        f"- package：`{package_name or '<default package>'}`\n"
+        f"- class：`{class_name}`\n"
+        f"- 方法数：`{analysis.get('method_count', 0)}`\n"
+        f"- 行数：`{analysis.get('line_count', 0)}`"
     )
 
 
@@ -1376,6 +1442,10 @@ class AgentService:
                 "为了避免普通对话里出现不可中断的长时间批处理，批量生成现在需要走右侧 Java 文件面板里的"
                 "“生成未测”或项目组里的“生成项目未测”按钮。那里会显示真实进度，并支持强制中断。"
             )
+        elif file_id and normalized["intent"] == "describe_current_file":
+            result = self.tool_analyze_file({"file_id": file_id})
+            results.append(result)
+            reply = describe_current_file_reply(message, result.get("analysis") or {})
         elif file_id and normalized["intent"] == "explain_latest_test":
             latest = self.latest_artifact_for_file(file_id)
             if latest is None:
