@@ -1,0 +1,5 @@
+project_key,baseline_lines,final_lines,line_gain,baseline_branches,final_branches,branch_gain,main_feedback_change
+codec,39/39,39/39,0,19/20,19/20,0,Final-suite materialization and retained bug evidence
+collections,61/127,117/127,56,20/50,43/50,23,Coverage-feedback refinement and suite-role finalization
+compress,150/171,138/171,-12,95/108,83/108,-12,Oracle repair of TarUtils byte-level diagnostics and final-suite materialization
+overall,250/337,294/337,44,134/178,145/178,11,"Post-baseline feedback correction, TarUtils oracle repair, and suite-role selection"

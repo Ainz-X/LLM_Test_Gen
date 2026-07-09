@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>A3 Test Agent</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="side">
+        <div class="brand">
+          <div class="mark">A3</div>
+          <div>
+            <h1>Test Agent</h1>
+            <p id="connectionStatus">Ready</p>
+          </div>
+        </div>
+
+        <section class="panel upload-panel">
+          <div class="panel-title">
+            <span>Java Source</span>
+            <button id="clearFileBtn" class="icon-btn" title="Clear selected file" type="button">×</button>
+          </div>
+          <label class="dropzone" for="fileInput">
+            <input id="fileInput" type="file" accept=".java,text/x-java-source,text/plain" />
+            <span class="drop-title">Choose .java</span>
+            <span id="fileMeta" class="drop-meta">No file selected</span>
+          </label>
+          <div id="analysisBox" class="analysis-box"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title">Workspace</div>
+          <div class="tool-grid">
+            <button class="tool-btn" data-prompt="查看当前 A3 workspace 状态和覆盖率摘要">Status</button>
+            <button class="tool-btn" data-prompt="验证当前 CSV、prompt 模板和生成数据是否一致">Validate</button>
+            <button class="tool-btn" data-prompt="解释当前项目还能用这些工具做什么">Ideas</button>
+          </div>
+        </section>
+
+        <section class="panel generated-panel">
+          <div class="panel-title">
+            <span>Generated</span>
+            <button id="refreshGeneratedBtn" class="icon-btn" title="Refresh generated tests" type="button">↻</button>
+          </div>
+          <div id="generatedList" class="generated-list"></div>
+        </section>
+      </aside>
+
+      <section class="chat">
+        <div class="chat-top">
+          <div>
+            <h2>Conversation</h2>
+            <p id="activeFileLabel">Workspace mode</p>
+          </div>
+          <div class="quick-actions">
+            <button class="quick-btn" data-prompt="分析我上传的 Java 文件，指出适合生成测试的方法和边界情况">Analyze</button>
+            <button class="quick-btn primary" data-prompt="为我上传的 Java 文件生成 JUnit 4 测试文件">Generate</button>
+          </div>
+        </div>
+
+        <div id="messages" class="messages" aria-live="polite"></div>
+
+        <form id="chatForm" class="composer">
+          <textarea
+            id="messageInput"
+            rows="2"
+            placeholder="Ask the agent..."
+            autocomplete="off"
+          ></textarea>
+          <button id="sendBtn" class="send-btn" type="submit" title="Send">→</button>
+        </form>
+      </section>
+    </main>
+
+    <template id="messageTemplate">
+      <article class="message">
+        <div class="bubble"></div>
+      </article>
+    </template>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

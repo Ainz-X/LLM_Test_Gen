@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FRAMEWORK_JAVA_HOME="${A3_FRAMEWORK_JAVA_HOME:?Set A3_FRAMEWORK_JAVA_HOME before invoking the Java shim}"
+BUILD_JAVA_HOME="${A3_BUILD_JAVA_HOME:?Set A3_BUILD_JAVA_HOME before invoking the Java shim}"
+
+FRAMEWORK_JAVA="$FRAMEWORK_JAVA_HOME/bin/java"
+BUILD_JAVA="$BUILD_JAVA_HOME/bin/java"
+
+for arg in "$@"; do
+  if [[ "$arg" == *"ant-launcher.jar"* ]]; then
+    exec "$BUILD_JAVA" "$@"
+  fi
+done
+
+exec "$FRAMEWORK_JAVA" "$@"

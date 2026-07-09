@@ -1,0 +1,38 @@
+project_key,project_dir,target_class,suite_archive,suite_source_count,compile_success_rows,runnable_test_classes,executed_test_classes,passed_test_classes,executed_test_methods,failed_test_methods,passed_test_methods,pass_rate_classes_pct,pass_rate_methods_pct,lines_total,lines_covered,line_coverage_pct,branches_total,branches_covered,branch_coverage_pct,bug_identified,bug_evidence,test_command_exit_code,coverage_command_exit_code,test_output_excerpt,coverage_output_excerpt
+codec,codec_18_buggy,org.apache.commons.codec.binary.StringUtils,/Users/zhaixinyang/4130a3/LLM_Test_Gen/Data/Generated_Suites/Codec-18b-a3generated.1.tar.bz2,53,53,53,52,35,183,20,163,67.31,89.07,39,39,100.0,20,19,95.0,yes,org.apache.commons.codec.binary.StringUtils_equals_java_lang_CharSequence_java_lang_CharSequence_r0_bug_targeted_Test::testEqualsWithDifferentLengthStringBuilders | StringUtils.equals incorrectly reports equality for different-length non-String CharSequence inputs.,0,0,"Failing tests: 20
+  - org.apache.commons.codec.binary.StringUtils_newIllegalStateException_java_lang_String_java_io_UnsupportedEncodingException_r0_nominal_stateful_Test
+  - org.apache.commons.codec.binary.StringUtils_equals_java_lang_CharSequence_java_lang_CharSequence_r0_bug_targeted_Test::testEqualsWithDifferentLengthStringBuilders
+  - org.apache.commons.codec.binary.StringUtils_getBytesUsAscii_java_lang_String_r0_exception_invalid_Test::testGetBytesUsAscii_CharsetNotInitialized
+  - org.apache.commons.codec.binary.StringUtils_getBytesUtf16Be_java_lang_String_r0_null_empty_boundary_Test::testGetBytesUtf16Be_SingleCharacter
+  - org.apache.commons.codec.binary.StringUtils_getBytesUtf16_java_lang_String_r0_exception_invalid_Test::testGetBytesUtf16_ValidInput
+  - org.apache.commons.codec.binary.StringUtils_getBytesUtf16_java_lang_String_r0_exception_invalid_Test::testGetBytesUtf16_ThrowsNullPointerException
+  - org.apache.commons.codec.binary.StringUtils_getBytesUtf16_java_lang_String_r0_nominal_stateful_Test::testGetBytesUtf16_withValidString
+  - org.apache.commons.codec.binary.StringUtils_getBytesUtf16_java_lang_String_r0_null_empty_boundary_Test::testGetBytesUtf16_SingleCharacter
+  - org.apache.commons.codec.binary.StringUtils_getBytesUtf16_java_lang_String_r0_null_empty_boundary_Test::testGetBytesUtf16_MultipleCharacters
+  - org.apache.commons.codec.binary.StringUtils_getBytesUtf8_java_lang_String_r0_null_empty_boundary_Test::testGetBytesUtf8_SpecialCharacters
+  - org.apache.commons.codec.binary.StringUtils_init_noargs_r0_exception_invalid_Test::testInvalidInputs
+  - org.apache.commons.codec.binary.StringUtils_newIllegalStateException_java_lang_String_java_io_UnsupportedEncodingException_r0_exception_invalid_Test::testNewIllegalStateException_withNullCharsetName
+  - org.apache.commons.codec.binary.StringUtils_newIllegalStateException_java_lang_String_java_io_UnsupportedEncodingException_r0_exception_invalid_Test::testNewIllegalStateException_withEmptyCharsetName
+  - org.apache.commons.codec.binary.StringUtils_newStringUsAscii_byteArray_r0_null_empty_boundary_Test::testNewStringUsAsciiWithNonAsciiInput
+  - org.apache.commons.codec.binary.StringUtils_newStringUtf16Be_byteArray_r0_exception_invalid_Test::testNewStringUtf16Be_InvalidUtf16BeInput
+  - org.apache.commons.codec.binary.StringUtils_newStringUtf16Be_byteArray_r0_null_empty_boundary_Test::testNewStringUtf16Be_InvalidBytes
+  - org.apache.commons.codec.binary.StringUtils_newStringUtf16Le_byteArray_r0_exception_invalid_Test::testNewStringUtf16Le_InvalidUtf16LeInput
+  - org.apache.commons.codec.binary.StringUtils_newStringUtf16_byteArray_r0_exception_invalid_Test::testNewStringUtf16WithInvalidUtf16Bytes
+  - org.apache.commons.codec.binary.StringUtils_newStringUtf8_byteArray_r0_exception_invalid_Test::testNewStringUtf8WithInvalidUtf8Bytes
+  - org.apache.commons.codec.binary.StringUtils_newString_byteArray_java_lang_String_r0_exception_invalid_Test::testNewString_UnsupportedEncodingException
+Extract test suite......................................................... OK
+Running ant (compile.gen.tests)............................................ OK
+Running ant (run.gen.tests)................................................ OK","Lines total: 39
+     Lines covered: 39
+  Conditions total: 20
+Conditions covered: 19
+     Line coverage: 100.0%
+Condition coverage: 95.0%
+Extract test suite......................................................... OK
+Running ant (compile.gen.tests)............................................ OK
+Running ant (coverage.instrument).......................................... OK
+Running ant (run.gen.tests)................................................ OK
+Running ant (coverage.report).............................................. OK
+WARNING: Some tests failed (see /Users/zhaixinyang/4130a3/codec_18_buggy/failing_tests)!"
+collections,collections_27_buggy,org.apache.commons.collections4.map.MultiValueMap,,0,0,0,0,0,0,0,0,0.0,0.0,0,0,0.0,0,0,0.0,no,,0,0,,
+compress,compress_45_buggy,org.apache.commons.compress.archivers.tar.TarUtils,,0,0,0,0,0,0,0,0,0.0,0.0,0,0,0.0,0,0,0.0,no,,0,0,,

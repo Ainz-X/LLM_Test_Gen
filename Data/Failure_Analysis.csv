@@ -1,0 +1,14 @@
+project_key,failure_type,count,representative_root_cause
+codec,compile,11,Generated imports/API usage or JDK/JUnit syntax incompatible with the Defects4J project.
+codec,runtime,1,Generated setup invokes helper/constructor behavior that throws outside the intended focal assertion.
+codec,oracle,16,"Encoding/String expectation mismatch, especially UTF-16 byte order, unsupported charset, or exception-message oracle."
+codec,bug-triggered,1,Expected failing test tied to the known Defects4J faulty focal method.
+codec,none,35,Passing tests or expected clean coverage rows retained for scoring.
+collections,compile,23,Generated test source incompatible with Collections generics or protected/private accessibility.
+collections,runtime,36,"Invalid MultiValueMap state setup, null map/factory misuse, raw type or serialization misuse."
+collections,oracle,3,"Incorrect expectation for MultiValueMap size, putAll, or null/empty collection behavior."
+collections,bug-triggered,1,Expected failing test tied to the known Defects4J faulty focal method.
+collections,none,5,Passing tests or expected clean coverage rows retained for scoring.
+compress,compile,14,Generated test source uses inaccessible helpers or incompatible API signatures.
+compress,bug-triggered,1,Expected failing test tied to the known Defects4J faulty focal method.
+compress,none,49,Passing tests or expected clean coverage rows retained for scoring.

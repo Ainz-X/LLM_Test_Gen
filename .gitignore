@@ -1,0 +1,48 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Frontend
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Runtime and generated data
+storage/
+Agent_App/backend/storage/
+Agent_App/storage/
+Data/Agent/runs/
+Data/Generated_Suites/
+Data/Prompts/generated/
+Data/Prompts/feedback/
+Data/Prompts/repair/
+Data/WebAgent/*.log
+Data/WebAgent/server_startup_error.log
+
+# Java build outputs
+target/
+build/
+out/
+.gradle/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

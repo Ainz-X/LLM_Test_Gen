@@ -1,0 +1,17 @@
+project_key,project_dir,target_class,suite_archive,suite_source_count,compile_success_rows,runnable_test_classes,executed_test_classes,passed_test_classes,executed_test_methods,failed_test_methods,passed_test_methods,pass_rate_classes_pct,pass_rate_methods_pct,lines_total,lines_covered,line_coverage_pct,branches_total,branches_covered,branch_coverage_pct,bug_identified,bug_evidence,test_command_exit_code,coverage_command_exit_code,test_output_excerpt,coverage_output_excerpt
+codec,codec_18_buggy,org.apache.commons.codec.binary.StringUtils,/Users/zhaixinyang/4130a3/LLM_Test_Gen/Data/Generated_Suites/Codec-18b-a3generated.1.tar.bz2,1,1,1,1,1,9,0,9,100.0,100.0,39,6,15.38,20,8,40.0,no,,0,0,"Failing tests: 0
+Extract test suite......................................................... OK
+Running ant (compile.gen.tests)............................................ OK
+Running ant (run.gen.tests)................................................ OK","Lines total: 39
+     Lines covered: 6
+  Conditions total: 20
+Conditions covered: 8
+     Line coverage: 15.4%
+Condition coverage: 40.0%
+Extract test suite......................................................... OK
+Running ant (compile.gen.tests)............................................ OK
+Running ant (coverage.instrument).......................................... OK
+Running ant (run.gen.tests)................................................ OK
+Running ant (coverage.report).............................................. OK"
+collections,collections_27_buggy,org.apache.commons.collections4.map.MultiValueMap,,0,0,0,0,0,0,0,0,0.0,0.0,0,0,0.0,0,0,0.0,no,,0,0,,
+compress,compress_45_buggy,org.apache.commons.compress.archivers.tar.TarUtils,,0,0,0,0,0,0,0,0,0.0,0.0,0,0,0.0,0,0,0.0,no,,0,0,,

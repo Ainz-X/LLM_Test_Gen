@@ -1,0 +1,6 @@
+version,implemented_artifact,evidence_source,compile_success_rows,line_coverage_pct,branch_coverage_pct,bug_identified,interpretation
+V0 naive reference,not used as final pipeline,A2 feedback / design baseline,n/a,n/a,n/a,n/a,"Risk baseline without richer context, partitions, repair, or coverage feedback."
+V1 context-rich round-0,Method_Context.csv + generation.yaml,baseline summary,147,74.18,75.28,3/3,Context plus zero-shot partitions finds all bugs but leaves Collections coverage weak.
+V2 clean pass-oriented selection,Suite Role=coverage,Coverage_Summary_final_coverage.csv,89,76.85,71.35,0/3,Passing-only suite gives perfect pass rate but sacrifices bug evidence and some diagnostic coverage.
+V3 bug-evidence separation,Suite Role=bug-evidence,Coverage_Summary_bug_evidence.csv,3,19.88,22.47,3/3,Separates expected failing tests from quality metrics and validates known faults.
+V4 final combined feedback suite,final_combined role filter,Coverage_Summary_final_combined.csv,148,87.24,81.46,3/3,"Combines compilable coverage, repaired TarUtils oracles, diagnostics, and bug evidence for Task 6 scoring."

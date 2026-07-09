@@ -1,0 +1,5 @@
+project_key,generation_rows,compile_success,final_combined_included,clean_coverage_rows,bug_evidence_rows,discarded_rows
+codec,64,53,53,35,1,11
+collections,68,45,45,5,1,23
+compress,64,50,50,49,1,14
+overall,196,148,148,89,3,48

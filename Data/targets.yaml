@@ -1,0 +1,32 @@
+managed_test_root: src/test/java/a3_generated
+projects:
+  codec:
+    project_id: Codec
+    bug_id: 18
+    workspace_dir: codec_18_buggy
+    class_fqn: org.apache.commons.codec.binary.StringUtils
+    focal_bug_method_fqn: org.apache.commons.codec.binary.StringUtils.equals(java.lang.CharSequence,java.lang.CharSequence)
+    focal_bug_method_label: equals
+    bug_target_intent: Expose the length-mismatch bug in non-String CharSequence equality by using different-length StringBuilder inputs.
+    expected_bug_signal: StringUtils.equals incorrectly reports equality for different-length non-String CharSequence inputs.
+    instrument_file: /Users/zhaixinyang/4130a3/LLM_Test_Gen/Data/instrument_classes/codec.txt
+  collections:
+    project_id: Collections
+    bug_id: 27
+    workspace_dir: collections_27_buggy
+    class_fqn: org.apache.commons.collections4.map.MultiValueMap
+    focal_bug_method_fqn: org.apache.commons.collections4.map.MultiValueMap.readObject(java.io.ObjectInputStream)
+    focal_bug_method_label: deserialize/readObject
+    bug_target_intent: Trigger unsafe deserialization by serializing a MultiValueMap configured with a raw String.class collection factory and then deserializing it.
+    expected_bug_signal: Deserialization accepts a non-Collection factory class instead of rejecting it.
+    instrument_file: /Users/zhaixinyang/4130a3/LLM_Test_Gen/Data/instrument_classes/collections.txt
+  compress:
+    project_id: Compress
+    bug_id: 45
+    workspace_dir: compress_45_buggy
+    class_fqn: org.apache.commons.compress.archivers.tar.TarUtils
+    focal_bug_method_fqn: org.apache.commons.compress.archivers.tar.TarUtils.formatLongOctalOrBinaryBytes(long,byte[],int,int)
+    focal_bug_method_label: formatLongOctalOrBinaryBytes
+    bug_target_intent: Force the 8-byte binary branch and assert round-trip correctness through parseOctalOrBinary for a non-octal value.
+    expected_bug_signal: The 8-byte binary formatting path falls through into the BigInteger formatter, causing an exception or preventing a correct parseOctalOrBinary round-trip.
+    instrument_file: /Users/zhaixinyang/4130a3/LLM_Test_Gen/Data/instrument_classes/compress.txt

@@ -1,0 +1,49 @@
+project_key,project_dir,target_class,suite_archive,suite_role_filter,suite_source_count,included_row_count,compile_success_rows,runnable_test_classes,executed_test_classes,passed_test_classes,executed_test_methods,failed_test_methods,passed_test_methods,pass_rate_classes_pct,pass_rate_methods_pct,lines_total,lines_covered,line_coverage_pct,branches_total,branches_covered,branch_coverage_pct,bug_identified,bug_evidence,test_command_exit_code,coverage_command_exit_code,test_output_excerpt,coverage_output_excerpt
+codec,codec_18_buggy,org.apache.commons.codec.binary.StringUtils,/Users/zhaixinyang/4130a3/LLM_Test_Gen/Data/Generated_Suites/Codec-18b-a3balancedcandidate.1.tar.bz2,"balanced-diagnostic,bug-evidence,coverage",36,36,53,36,36,35,127,1,126,97.22,99.21,39,38,97.44,20,19,95.0,yes,org.apache.commons.codec.binary.StringUtils_equals_java_lang_CharSequence_java_lang_CharSequence_r0_bug_targeted_Test::testEqualsWithDifferentLengthStringBuilders | StringUtils.equals incorrectly reports equality for different-length non-String CharSequence inputs.,0,0,"Failing tests: 1
+  - org.apache.commons.codec.binary.StringUtils_equals_java_lang_CharSequence_java_lang_CharSequence_r0_bug_targeted_Test::testEqualsWithDifferentLengthStringBuilders
+Extract test suite......................................................... OK
+Running ant (compile.gen.tests)............................................ OK
+Running ant (run.gen.tests)................................................ OK","Lines total: 39
+     Lines covered: 38
+  Conditions total: 20
+Conditions covered: 19
+     Line coverage: 97.4%
+Condition coverage: 95.0%
+Extract test suite......................................................... OK
+Running ant (compile.gen.tests)............................................ OK
+Running ant (coverage.instrument).......................................... OK
+Running ant (run.gen.tests)................................................ OK
+Running ant (coverage.report).............................................. OK
+WARNING: Some tests failed (see /Users/zhaixinyang/4130a3/codec_18_buggy/failing_tests)!"
+collections,collections_27_buggy,org.apache.commons.collections4.map.MultiValueMap,/Users/zhaixinyang/4130a3/LLM_Test_Gen/Data/Generated_Suites/Collections-27b-a3balancedcandidate.1.tar.bz2,"balanced-diagnostic,bug-evidence,coverage",6,6,45,6,6,5,16,1,15,83.33,93.75,127,107,84.25,50,37,74.0,yes,org.apache.commons.collections4.map.MultiValueMap_readObject_java_io_ObjectInputStream_r0_bug_targeted_Test::testUnsafeDeserializationRejectsNonCollectionFactory | Deserialization accepts a non-Collection factory class instead of rejecting it.,0,0,"Failing tests: 1
+  - org.apache.commons.collections4.map.MultiValueMap_readObject_java_io_ObjectInputStream_r0_bug_targeted_Test::testUnsafeDeserializationRejectsNonCollectionFactory
+Extract test suite......................................................... OK
+Running ant (compile.gen.tests)............................................ OK
+Running ant (run.gen.tests)................................................ OK","Lines total: 127
+     Lines covered: 107
+  Conditions total: 50
+Conditions covered: 37
+     Line coverage: 84.3%
+Condition coverage: 74.0%
+Extract test suite......................................................... OK
+Running ant (compile.gen.tests)............................................ OK
+Running ant (coverage.instrument).......................................... OK
+Running ant (run.gen.tests)................................................ OK
+Running ant (coverage.report).............................................. OK
+WARNING: Some tests failed (see /Users/zhaixinyang/4130a3/collections_27_buggy/failing_tests)!"
+compress,compress_45_buggy,org.apache.commons.compress.archivers.tar.TarUtils,/Users/zhaixinyang/4130a3/LLM_Test_Gen/Data/Generated_Suites/Compress-45b-a3balancedcandidate.1.tar.bz2,"balanced-diagnostic,bug-evidence,coverage",36,36,50,36,36,35,95,1,94,97.22,98.95,171,126,73.68,108,78,72.22,yes,"org.apache.commons.compress.archivers.tar.TarUtils_formatLongOctalOrBinaryBytes_long_byteArray_int_int_r0_bug_targeted_Test::testFormatLongOctalOrBinaryBytesEightByteRoundTrip | The 8-byte binary formatting path falls through into the BigInteger formatter, causing an exception or preventing a correct parseOctalOrBinary round-trip.",0,0,"Failing tests: 1
+  - org.apache.commons.compress.archivers.tar.TarUtils_formatLongOctalOrBinaryBytes_long_byteArray_int_int_r0_bug_targeted_Test::testFormatLongOctalOrBinaryBytesEightByteRoundTrip
+Extract test suite......................................................... OK
+Running ant (compile.gen.tests)............................................ OK
+Running ant (run.gen.tests)................................................ OK","Lines total: 171
+     Lines covered: 126
+  Conditions total: 108
+Conditions covered: 78
+     Line coverage: 73.7%
+Condition coverage: 72.2%
+Extract test suite......................................................... OK
+Running ant (compile.gen.tests)............................................ OK
+Running ant (coverage.instrument).......................................... OK
+Running ant (run.gen.tests)................................................ OK
+Running ant (coverage.report).............................................. OK
+WARNING: Some tests failed (see /Users/zhaixinyang/4130a3/compress_45_buggy/failing_tests)!"
