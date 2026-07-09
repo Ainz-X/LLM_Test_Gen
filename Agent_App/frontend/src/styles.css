@@ -319,8 +319,12 @@ textarea:focus {
   font-size: 12px;
 }
 
-.mini-text-btn {
-  min-height: 30px;
+.project-action-btn {
+  display: inline-flex;
+  height: 32px;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--surface);
@@ -328,18 +332,6 @@ textarea:focus {
   padding: 0 9px;
   white-space: nowrap;
   font-size: 12px;
-}
-
-.project-action-btn {
-  display: grid;
-  width: 32px;
-  height: 32px;
-  min-height: 32px;
-  place-items: center;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface);
-  color: var(--muted);
 }
 
 .mini-icon-btn {
@@ -632,20 +624,23 @@ details code,
 
 .file-toolbar {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(38px, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 7px;
 }
 
 .file-toolbar button {
-  display: grid;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-width: 0;
   height: 36px;
   min-height: 36px;
-  place-items: center;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--surface-soft);
   color: var(--text);
+  padding: 0 8px;
+  overflow-wrap: anywhere;
 }
 
 .compact-actions {
@@ -702,17 +697,27 @@ details code,
 }
 
 .modal-header {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: flex-start;
-  justify-content: space-between;
   gap: 16px;
   padding: 14px 16px;
   border-bottom: 1px solid var(--line);
 }
 
+.modal-header > div:first-child {
+  min-width: 0;
+}
+
+.modal-header .muted {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .modal-actions {
   justify-content: flex-end;
   flex-wrap: wrap;
+  min-width: max-content;
 }
 
 .modal-actions .danger-action {
@@ -757,6 +762,28 @@ details code,
   justify-content: space-between;
   color: var(--muted);
   font-size: 12px;
+}
+
+.current-task-row {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.current-task-row span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.current-task-row strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-size: 13px;
 }
 
 .task-panel {

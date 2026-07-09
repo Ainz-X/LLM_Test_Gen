@@ -3,8 +3,6 @@ import { createRoot } from "react-dom/client";
 import {
   BarChart3,
   Bot,
-  CheckSquare2,
-  Database,
   Download,
   Eye,
   FileArchive,
@@ -34,7 +32,6 @@ import {
   cancelJob,
   createConversation,
   deleteConversation,
-  deleteUploadedFile,
   deleteUploadedFiles,
   downloadArtifact,
   downloadArtifactsZip,
@@ -83,11 +80,9 @@ const text = {
   submitUpload: "上传并解析",
   files: "\u6587\u4ef6",
   javaFiles: "Java \u6587\u4ef6",
-  deleteFile: "\u5220\u5f53\u524d",
   deleteSelectedFiles: "\u6279\u91cf\u5220",
   selectAll: "\u5168\u9009",
   batchGenerateMissing: "\u751f\u6210\u672a\u6d4b",
-  extractContext: "提取上下文",
   deleteConversation: "\u5220\u9664\u5bf9\u8bdd",
   methods: "\u4e2a\u65b9\u6cd5",
   artifacts: "\u751f\u6210\u4ea7\u7269",
@@ -118,6 +113,7 @@ type TaskModalState = {
   title: string;
   detail: string;
   progress: number;
+  currentItem?: string;
   indeterminate?: boolean;
   cancelled?: boolean;
   jobId?: string;
@@ -226,11 +222,6 @@ function App() {
   const contextAbortRef = useRef<{ controller: AbortController; jobId: string } | null>(null);
 
   const activeFile = useMemo(() => files.find((file) => file.id === activeFileId), [files, activeFileId]);
-  const activeProjectId = activeFile?.analysis._project_id;
-  const activeProjectFiles = useMemo(
-    () => (activeProjectId ? files.filter((file) => file.analysis._project_id === activeProjectId) : []),
-    [files, activeProjectId]
-  );
   const fileGroups = useMemo<FileGroup[]>(() => {
     const groups = new Map<string, FileGroup>();
     for (const file of files) {
@@ -366,23 +357,6 @@ function App() {
     setSelectedFileIds((current) => (current.length === files.length ? [] : files.map((file) => file.id)));
   }
 
-  async function deleteActiveFile() {
-    if (!activeFileId || busy) return;
-    setBusy(true);
-    try {
-      await deleteUploadedFile(activeFileId);
-      const nextFiles = await getFiles();
-      setFiles(nextFiles);
-      setActiveFileId(nextFiles[0]?.id);
-      setSelectedFileIds((current) => current.filter((id) => id !== activeFileId));
-      setArtifacts([]);
-      setSelectedArtifact(undefined);
-      setArtifactCode("");
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function deleteSelectedFiles() {
     if (!selectedFileIds.length || busy) return;
     setBusy(true);
@@ -452,11 +426,15 @@ function App() {
           onProgress: (payload) => {
             const percent = Number(payload.percent || 0);
             const message = String(payload.message || title);
+            const total = Number(payload.total || fileIds.length);
+            const currentIndex = Number(payload.current || 0);
+            const fileName = String(payload.file_name || "");
             setStatus(message);
-            setTaskModal((current) => ({
-              ...current,
+            setTaskModal((state) => ({
+              ...state,
               progress: Math.max(0, Math.min(100, percent)),
-              detail: message
+              detail: total ? `正在生成 ${Math.min(total, currentIndex + 1)}/${total}` : "正在生成",
+              currentItem: fileName || message.replace(/^.*?:\s*/, "")
             }));
           },
           onItem: (payload) => {
@@ -483,6 +461,7 @@ function App() {
               running: false,
               progress: 100,
               detail: `完成：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个`,
+              currentItem: "",
               result: payload
             }));
           },
@@ -502,6 +481,7 @@ function App() {
               running: false,
               cancelled: true,
               detail: `已中断：已生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个`,
+              currentItem: "",
               result: finalResult
             }));
           },
@@ -526,6 +506,7 @@ function App() {
         detail: result.cancelled
           ? `已中断：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个`
           : `完成：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个`,
+        currentItem: "",
         result
       }));
       setMessages((current) => [
@@ -547,6 +528,7 @@ function App() {
           ...current,
           running: false,
           cancelled: true,
+          currentItem: "",
           detail: "已请求中断；后端会停止继续处理后续文件"
         }));
         return;
@@ -555,6 +537,7 @@ function App() {
         ...current,
         running: false,
         progress: 100,
+        currentItem: "",
         detail: err instanceof Error ? err.message : "批量生成失败"
       }));
     } finally {
@@ -684,22 +667,6 @@ function App() {
       setBusy(false);
       setStatus("");
     }
-  }
-
-  async function extractContextForCurrentSelection() {
-    const targetIds = selectedFileIds.length
-      ? selectedFileIds
-      : activeProjectFiles.length
-        ? activeProjectFiles.map((file) => file.id)
-        : activeFileId
-          ? [activeFileId]
-          : files.map((file) => file.id);
-    const label = selectedFileIds.length
-      ? "提取已选 Java 上下文"
-      : activeProjectFiles.length
-        ? "提取当前项目上下文"
-        : "提取 Java 上下文";
-    await extractContextForFiles(targetIds, label);
   }
 
   async function submitChat(event?: FormEvent, preset?: string) {
@@ -1061,29 +1028,13 @@ function App() {
               </div>
               <div className="file-toolbar">
                 <button type="button" title={text.selectAll} onClick={toggleAllFiles} disabled={!files.length || busy}>
-                  <CheckSquare2 size={16} />
+                  {text.selectAll}
                 </button>
                 <button type="button" title={text.deleteSelectedFiles} onClick={deleteSelectedFiles} disabled={!selectedFileIds.length || busy}>
-                  <Trash2 size={15} />
+                  删除已选
                 </button>
-                <button type="button" title={text.deleteFile} onClick={deleteActiveFile} disabled={!activeFileId || busy}>
-                  <Trash2 size={15} />
-                </button>
-                <button type="button" title="为已选、当前项目或全部 Java 文件提取 Jimple/FQN/方法上下文" onClick={extractContextForCurrentSelection} disabled={!files.length || busy}>
-                  <Database size={15} />
-                </button>
-                {activeProjectFiles.length > 1 && (
-                  <button
-                    type="button"
-                    title="为当前项目中尚未生成测试的 Java 文件生成测试"
-                    onClick={() => generateForFiles(activeProjectFiles.map((file) => file.id), "为当前项目生成未测测试", true)}
-                    disabled={busy}
-                  >
-                    <PackageOpen size={15} />
-                  </button>
-                )}
                 <button type="button" title="为已选或全部未生成测试的 Java 文件生成测试" onClick={batchGenerateMissingTests} disabled={!files.length || busy}>
-                  <Bot size={15} />
+                  {text.batchGenerateMissing}
                 </button>
               </div>
               <div className="scroll-list files-list">
@@ -1103,7 +1054,7 @@ function App() {
                             onClick={() => extractContextForFiles(group.files.map((file) => file.id), `提取项目 ${group.name} 上下文`)}
                             disabled={busy}
                           >
-                            <Database size={15} />
+                            上下文
                           </button>
                           <button
                             className="project-action-btn"
@@ -1112,7 +1063,7 @@ function App() {
                             onClick={() => generateForFiles(group.files.map((file) => file.id), `为项目 ${group.name} 生成未测测试`, true)}
                             disabled={busy}
                           >
-                            <Bot size={15} />
+                            生成
                           </button>
                         </div>
                       )}
@@ -1233,6 +1184,13 @@ function App() {
                 <span>{Math.round(taskModal.progress)}%</span>
                 <span>{taskModal.running ? "处理中" : taskModal.cancelled ? "已中断" : "完成"}</span>
               </div>
+
+              {taskModal.currentItem && (
+                <div className="current-task-row">
+                  <span>当前文件</span>
+                  <strong>{taskModal.currentItem}</strong>
+                </div>
+              )}
 
               {!!taskModal.files.length && (
                 <section className="task-panel">
