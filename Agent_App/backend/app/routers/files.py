@@ -4,6 +4,7 @@ import hashlib
 import io
 import zipfile
 from pathlib import Path
+from typing import BinaryIO
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -89,11 +90,61 @@ def should_skip_zip_member(name: str) -> bool:
     )
 
 
+def existing_uploaded_file(
+    db: Session,
+    user: User,
+    sha256: str,
+    original_name: str,
+    project_id: str | None = None,
+    relative_name: str | None = None,
+) -> UploadedFile | None:
+    candidates = (
+        db.query(UploadedFile)
+        .filter(UploadedFile.user_id == user.id, UploadedFile.sha256 == sha256)
+        .order_by(UploadedFile.created_at.asc())
+        .all()
+    )
+    for candidate in candidates:
+        analysis = candidate.analysis or {}
+        if project_id:
+            if analysis.get("_project_id") == project_id and analysis.get("_project_relative_path") == relative_name:
+                return candidate
+        elif not analysis.get("_project_id") and candidate.original_name == original_name:
+            return candidate
+    return None
+
+
+def safe_zip_entries(archive: zipfile.ZipFile) -> tuple[list[tuple[zipfile.ZipInfo, Path, str]], list[dict[str, str]]]:
+    entries: list[tuple[zipfile.ZipInfo, Path, str]] = []
+    rejected: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for info in archive.infolist():
+        if info.is_dir() or should_skip_zip_member(info.filename):
+            continue
+        if Path(info.filename).is_absolute() or ".." in Path(info.filename).parts:
+            rejected.append({"name": info.filename, "reason": "unsafe zip path"})
+            continue
+        try:
+            relative_path, relative_name = safe_relative_path(info.filename)
+        except ValueError as exc:
+            rejected.append({"name": info.filename, "reason": str(exc)})
+            continue
+        if relative_name in seen:
+            rejected.append({"name": info.filename, "reason": "duplicate path inside zip"})
+            continue
+        seen.add(relative_name)
+        entries.append((info, relative_path, relative_name))
+    return entries, rejected
+
+
 def persist_java(name: str, content: bytes, db: Session, user: User) -> UploadedFile:
     safe = safe_name(name)
     if not safe.endswith(".java"):
         raise ValueError("Only .java files are supported")
     digest = hashlib.sha256(content).hexdigest()
+    existing = existing_uploaded_file(db, user, digest, safe)
+    if existing:
+        return existing
     folder = settings.storage_dir / "uploads" / user.id / digest[:16]
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / safe
@@ -107,6 +158,52 @@ def persist_java(name: str, content: bytes, db: Session, user: User) -> Uploaded
     record = UploadedFile(
         user_id=user.id,
         original_name=safe,
+        storage_path=str(path),
+        sha256=digest,
+        size_bytes=len(content),
+        analysis=analysis,
+    )
+    db.add(record)
+    return record
+
+
+def persist_project_java_record(
+    project_name: str,
+    project_id: str,
+    build_tool: str,
+    build_root: Path,
+    project_folder: Path,
+    relative_name: str,
+    path: Path,
+    content: bytes,
+    db: Session,
+    user: User,
+) -> UploadedFile:
+    digest = hashlib.sha256(content).hexdigest()
+    display_name = relative_name if len(relative_name) <= 255 else "..." + relative_name[-252:]
+    existing = existing_uploaded_file(db, user, digest, display_name, project_id=project_id, relative_name=relative_name)
+    if existing:
+        return existing
+
+    source = content.decode("utf-8", errors="replace")
+    analysis = analyze_java_source(source, Path(relative_name).name)
+    object_key = f"projects/{user.id}/{project_id}/{relative_name}"
+    stored_object = put_object(path, object_key)
+    if stored_object:
+        analysis["_object_key"] = stored_object
+    analysis.update(
+        {
+            "_project_id": project_id,
+            "_project_name": project_name,
+            "_project_root": str(build_root),
+            "_project_storage_root": str(project_folder),
+            "_project_build_tool": build_tool,
+            "_project_relative_path": relative_name,
+        }
+    )
+    record = UploadedFile(
+        user_id=user.id,
+        original_name=display_name,
         storage_path=str(path),
         sha256=digest,
         size_bytes=len(content),
@@ -155,54 +252,87 @@ def persist_project_files(
     build_root = project_folder / Path(build_root_rel) if build_root_rel else project_folder
     uploaded: list[UploadedFile] = []
     for relative_name, path, content in java_items:
-        source = content.decode("utf-8", errors="replace")
-        analysis = analyze_java_source(source, Path(relative_name).name)
-        object_key = f"projects/{user.id}/{project_id}/{relative_name}"
-        stored_object = put_object(path, object_key)
-        if stored_object:
-            analysis["_object_key"] = stored_object
-        analysis.update(
-            {
-                "_project_id": project_id,
-                "_project_name": project_name,
-                "_project_root": str(build_root),
-                "_project_storage_root": str(project_folder),
-                "_project_build_tool": build_tool,
-                "_project_relative_path": relative_name,
-            }
+        uploaded.append(
+            persist_project_java_record(
+                project_name,
+                project_id,
+                build_tool,
+                build_root,
+                project_folder,
+                relative_name,
+                path,
+                content,
+                db,
+                user,
+            )
         )
-        display_name = relative_name if len(relative_name) <= 255 else "..." + relative_name[-252:]
-        record = UploadedFile(
-            user_id=user.id,
-            original_name=display_name,
-            storage_path=str(path),
-            sha256=hashlib.sha256(content).hexdigest(),
-            size_bytes=len(content),
-            analysis=analysis,
-        )
-        db.add(record)
-        uploaded.append(record)
+    return uploaded, rejected
+
+
+def persist_project_archive(name: str, archive: zipfile.ZipFile, db: Session, user: User) -> tuple[list[UploadedFile], list[dict[str, str]]]:
+    entries, rejected = safe_zip_entries(archive)
+    if not entries:
+        return [], rejected
+
+    digest_source = hashlib.sha256()
+    relative_names: list[str] = []
+    for info, _relative_path, relative_name in sorted(entries, key=lambda item: item[2]):
+        digest_source.update(relative_name.encode("utf-8", errors="replace"))
+        digest_source.update(str(info.file_size).encode("ascii"))
+        digest_source.update(str(info.CRC).encode("ascii"))
+    project_id = digest_source.hexdigest()[:16]
+    project_folder = settings.storage_dir / "projects" / user.id / project_id
+    project_folder.mkdir(parents=True, exist_ok=True)
+
+    for _info, _relative_path, relative_name in entries:
+        relative_names.append(relative_name)
+    build_tool, build_root_rel = detect_project_root(relative_names)
+    build_root = project_folder / Path(build_root_rel) if build_root_rel else project_folder
+
+    uploaded: list[UploadedFile] = []
+    for info, relative_path, relative_name in entries:
+        target = project_folder / relative_path
+        try:
+            target.resolve().relative_to(project_folder.resolve())
+        except ValueError:
+            rejected.append({"name": info.filename, "reason": "unsafe project path"})
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = archive.read(info)
+        target.write_bytes(content)
+        if relative_name.endswith(".java"):
+            uploaded.append(
+                persist_project_java_record(
+                    name,
+                    project_id,
+                    build_tool,
+                    build_root,
+                    project_folder,
+                    relative_name,
+                    target,
+                    content,
+                    db,
+                    user,
+                )
+            )
     return uploaded, rejected
 
 
 def persist_project_zip(name: str, content: bytes, db: Session, user: User) -> tuple[list[UploadedFile], list[dict[str, str]]]:
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            file_items: list[tuple[str, bytes]] = []
-            rejected: list[dict[str, str]] = []
-            for info in archive.infolist():
-                if info.is_dir():
-                    continue
-                if should_skip_zip_member(info.filename):
-                    continue
-                if Path(info.filename).is_absolute() or ".." in Path(info.filename).parts:
-                    rejected.append({"name": info.filename, "reason": "unsafe zip path"})
-                    continue
-                file_items.append((info.filename, archive.read(info)))
+            return persist_project_archive(name, archive, db, user)
     except zipfile.BadZipFile:
         return [], [{"name": name, "reason": "invalid zip file"}]
-    uploaded, nested_rejected = persist_project_files(name, file_items, db, user)
-    return uploaded, [*rejected, *nested_rejected]
+
+
+def persist_project_zip_file(name: str, file_obj: BinaryIO, db: Session, user: User) -> tuple[list[UploadedFile], list[dict[str, str]]]:
+    try:
+        file_obj.seek(0)
+        with zipfile.ZipFile(file_obj) as archive:
+            return persist_project_archive(name, archive, db, user)
+    except zipfile.BadZipFile:
+        return [], [{"name": name, "reason": "invalid zip file"}]
 
 
 def delete_file_record(file: UploadedFile, db: Session, user: User) -> int:
@@ -257,16 +387,15 @@ def upload_batch(
     uploaded: list[UploadedFile] = []
     rejected: list[dict[str, str]] = []
 
-    file_items = [(file.filename or "Uploaded.java", file.file.read()) for file in files]
-    zip_items = [(name, content) for name, content in file_items if name.lower().endswith(".zip")]
-    loose_items = [(name, content) for name, content in file_items if not name.lower().endswith(".zip")]
+    for file in files:
+        raw_name = file.filename or "Uploaded.java"
+        if raw_name.lower().endswith(".zip"):
+            zip_uploaded, zip_rejected = persist_project_zip_file(raw_name, file.file, db, user)
+            uploaded.extend(zip_uploaded)
+            rejected.extend(zip_rejected)
+            continue
 
-    for raw_name, content in zip_items:
-        zip_uploaded, zip_rejected = persist_project_zip(raw_name, content, db, user)
-        uploaded.extend(zip_uploaded)
-        rejected.extend(zip_rejected)
-
-    for raw_name, content in loose_items:
+        content = file.file.read()
         normalized_name = raw_name.replace("\\", "/")
         if "/" in normalized_name:
             rejected.append({"name": raw_name, "reason": "project folders must be uploaded as a .zip file"})

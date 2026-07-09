@@ -226,6 +226,10 @@ function App() {
     return Array.from(groups.values());
   }, [files]);
   const artifactName = (artifact: Artifact) => artifact.storage_path.split(/[\\/]/).pop() || "GeneratedTest.java";
+  const mergeFilesById = (incoming: UploadedFile[], current: UploadedFile[]) => [
+    ...incoming,
+    ...current.filter((file) => !incoming.some((next) => next.id === file.id))
+  ];
 
   async function refresh() {
     const [conversationRows, fileRows] = await Promise.all([getConversations(), getFiles()]);
@@ -509,7 +513,7 @@ function App() {
     });
     try {
       const payload = await uploadJavaBatch(accepted);
-      setFiles((current) => [...payload.files, ...current]);
+      setFiles((current) => mergeFilesById(payload.files, current));
       if (payload.files[0]) setActiveFileId(payload.files[0].id);
       setSelectedFileIds(payload.files.map((file) => file.id));
       setArtifacts([]);

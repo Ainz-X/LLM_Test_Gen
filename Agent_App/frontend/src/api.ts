@@ -67,6 +67,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (auth) headers.set("Authorization", `Bearer ${auth}`);
   const response = await fetch(`${API_BASE}${path}`, { ...init, headers });
   if (!response.ok) {
+    if (response.status === 413) {
+      throw new Error("上传文件过大。当前反向代理允许最大 1GB，请去掉 target/build/.git 等目录后重新压缩上传。");
+    }
     const text = await response.text();
     throw new Error(text || response.statusText);
   }
