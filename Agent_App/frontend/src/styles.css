@@ -130,6 +130,7 @@ textarea:focus {
 .send-btn,
 .stop-btn,
 .upload-actions label,
+.upload-actions button,
 .artifact-actions button,
 .modal-actions button,
 .feedback-row button {
@@ -190,7 +191,8 @@ textarea:focus {
 .header-actions button,
 .artifact-actions button,
 .modal-actions button,
-.upload-actions label {
+.upload-actions label,
+.upload-actions button {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -303,9 +305,8 @@ textarea:focus {
 .project-header .project-actions {
   display: flex;
   flex: 0 0 auto;
-  flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 6px;
+  gap: 5px;
 }
 
 .project-header strong {
@@ -327,6 +328,18 @@ textarea:focus {
   padding: 0 9px;
   white-space: nowrap;
   font-size: 12px;
+}
+
+.project-action-btn {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--muted);
 }
 
 .mini-icon-btn {
@@ -564,15 +577,75 @@ details code,
 }
 
 .upload-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  justify-content: stretch;
+  gap: 8px;
+}
+
+.upload-actions label,
+.upload-actions button {
   justify-content: center;
+  min-width: 0;
 }
 
 .upload-actions input {
   display: none;
 }
 
+.pending-upload {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  text-align: left;
+}
+
+.pending-upload span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-upload button {
+  display: grid;
+  width: 30px;
+  height: 28px;
+  min-height: 28px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--muted);
+}
+
 .artifact-actions {
   flex-wrap: wrap;
+}
+
+.file-toolbar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(38px, 1fr));
+  gap: 7px;
+}
+
+.file-toolbar button {
+  display: grid;
+  min-width: 0;
+  height: 36px;
+  min-height: 36px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--text);
 }
 
 .compact-actions {

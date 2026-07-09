@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import {
   BarChart3,
   Bot,
+  CheckSquare2,
   Database,
   Download,
   Eye,
@@ -19,7 +20,8 @@ import {
   ThumbsUp,
   Trash2,
   Upload,
-  UserRound
+  UserRound,
+  X
 } from "lucide-react";
 import {
   Artifact,
@@ -77,6 +79,8 @@ const text = {
   tabHint: "\u6309 Tab \u63d2\u5165\u5efa\u8bae\u95ee\u9898",
   dropTitle: "\u62d6\u62fd Java \u6587\u4ef6\u6216 zip \u5305",
   dropHint: "支持单个 .java、多个 .java，或完整项目 .zip。项目请先压缩成 zip 再上传。",
+  chooseUpload: "选择文件",
+  submitUpload: "上传并解析",
   files: "\u6587\u4ef6",
   javaFiles: "Java \u6587\u4ef6",
   deleteFile: "\u5220\u5f53\u524d",
@@ -208,6 +212,7 @@ function App() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [dropActive, setDropActive] = useState(false);
+  const [pendingUploadFiles, setPendingUploadFiles] = useState<File[]>([]);
   const [status, setStatus] = useState("");
   const [workspaceSummary, setWorkspaceSummary] = useState<Record<string, unknown> | null>(null);
   const [suggestionIndex, setSuggestionIndex] = useState(0);
@@ -242,6 +247,11 @@ function App() {
     return Array.from(groups.values());
   }, [files]);
   const artifactName = (artifact: Artifact) => artifact.storage_path.split(/[\\/]/).pop() || "GeneratedTest.java";
+  const uploadSummary = useMemo(() => {
+    if (!pendingUploadFiles.length) return "";
+    const first = pendingUploadFiles[0].name;
+    return pendingUploadFiles.length === 1 ? first : `${first} 等 ${pendingUploadFiles.length} 个文件`;
+  }, [pendingUploadFiles]);
   const mergeFilesById = (incoming: UploadedFile[], current: UploadedFile[]) => [
     ...incoming,
     ...current.filter((file) => !incoming.some((next) => next.id === file.id))
@@ -810,13 +820,23 @@ function App() {
     } finally {
       setBusy(false);
       setDropActive(false);
+      setPendingUploadFiles([]);
     }
+  }
+
+  function stageUploadFiles(nextFiles: File[]) {
+    const accepted = nextFiles.filter((file) => file.name.endsWith(".java") || file.name.endsWith(".zip"));
+    setPendingUploadFiles(accepted);
+  }
+
+  async function submitPendingUpload() {
+    await handleFiles(pendingUploadFiles);
   }
 
   function drop(event: DragEvent<HTMLElement>) {
     event.preventDefault();
     setDropActive(false);
-    handleFiles(Array.from(event.dataTransfer.files)).catch(console.error);
+    stageUploadFiles(Array.from(event.dataTransfer.files));
   }
 
   function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -1008,10 +1028,30 @@ function App() {
               <div className="upload-actions">
                 <label>
                   <FileCode2 size={15} />
-                  {text.files}
-                  <input type="file" accept=".java,.zip" multiple onChange={(event) => handleFiles(Array.from(event.target.files || [])).catch(console.error)} />
+                  {text.chooseUpload}
+                  <input
+                    type="file"
+                    accept=".java,.zip"
+                    multiple
+                    onChange={(event) => {
+                      stageUploadFiles(Array.from(event.target.files || []));
+                      event.currentTarget.value = "";
+                    }}
+                  />
                 </label>
+                <button type="button" onClick={() => submitPendingUpload().catch(console.error)} disabled={!pendingUploadFiles.length || busy}>
+                  <Upload size={15} />
+                  {text.submitUpload}
+                </button>
               </div>
+              {pendingUploadFiles.length > 0 && (
+                <div className="pending-upload">
+                  <span title={uploadSummary}>{uploadSummary}</span>
+                  <button type="button" title="清空待上传文件" onClick={() => setPendingUploadFiles([])} disabled={busy}>
+                    <X size={14} />
+                  </button>
+                </div>
+              )}
             </section>
 
             <section className="side-section">
@@ -1019,21 +1059,18 @@ function App() {
                 <FileCode2 size={16} />
                 {text.javaFiles}
               </div>
-              <div className="artifact-actions compact-actions">
+              <div className="file-toolbar">
                 <button type="button" title={text.selectAll} onClick={toggleAllFiles} disabled={!files.length || busy}>
-                  {text.selectAll}
+                  <CheckSquare2 size={16} />
                 </button>
                 <button type="button" title={text.deleteSelectedFiles} onClick={deleteSelectedFiles} disabled={!selectedFileIds.length || busy}>
                   <Trash2 size={15} />
-                  {text.deleteSelectedFiles}
                 </button>
                 <button type="button" title={text.deleteFile} onClick={deleteActiveFile} disabled={!activeFileId || busy}>
                   <Trash2 size={15} />
-                  {text.deleteFile}
                 </button>
                 <button type="button" title="为已选、当前项目或全部 Java 文件提取 Jimple/FQN/方法上下文" onClick={extractContextForCurrentSelection} disabled={!files.length || busy}>
                   <Database size={15} />
-                  {text.extractContext}
                 </button>
                 {activeProjectFiles.length > 1 && (
                   <button
@@ -1043,12 +1080,10 @@ function App() {
                     disabled={busy}
                   >
                     <PackageOpen size={15} />
-                    当前项目
                   </button>
                 )}
                 <button type="button" title="为已选或全部未生成测试的 Java 文件生成测试" onClick={batchGenerateMissingTests} disabled={!files.length || busy}>
                   <Bot size={15} />
-                  {text.batchGenerateMissing}
                 </button>
               </div>
               <div className="scroll-list files-list">
@@ -1062,20 +1097,22 @@ function App() {
                       {group.id !== "loose" && (
                         <div className="project-actions">
                           <button
-                            className="mini-text-btn"
+                            className="project-action-btn"
                             type="button"
+                            title="提取当前项目上下文"
                             onClick={() => extractContextForFiles(group.files.map((file) => file.id), `提取项目 ${group.name} 上下文`)}
                             disabled={busy}
                           >
-                            提取上下文
+                            <Database size={15} />
                           </button>
                           <button
-                            className="mini-text-btn"
+                            className="project-action-btn"
                             type="button"
+                            title="生成当前项目未测测试"
                             onClick={() => generateForFiles(group.files.map((file) => file.id), `为项目 ${group.name} 生成未测测试`, true)}
                             disabled={busy}
                           >
-                            生成项目未测
+                            <Bot size={15} />
                           </button>
                         </div>
                       )}
