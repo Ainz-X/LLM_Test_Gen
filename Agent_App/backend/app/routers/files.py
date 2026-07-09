@@ -31,6 +31,7 @@ from app.schemas import (
 from app.security import get_current_user
 from app.services.agent_service import AgentService, GenerationCancelled
 from app.services.java_analysis import analyze_java_source
+from app.services.source_selection import file_source_name, source_role_analysis
 from app.services.storage_service import put_object, remove_object
 from app.tasks.context_extraction import extract_code_context_task
 
@@ -145,6 +146,27 @@ def existing_uploaded_file(
     return None
 
 
+def annotate_file_source_role(file: UploadedFile, relative_name: str | None = None) -> UploadedFile:
+    name = relative_name or file_source_name(file) or file.original_name
+    analysis = source_role_analysis(file.analysis or {}, name)
+    if analysis != (file.analysis or {}):
+        file.analysis = analysis
+    return file
+
+
+def uploaded_file_payload(file: UploadedFile) -> dict[str, object]:
+    name = file_source_name(file) or file.original_name
+    analysis = source_role_analysis(file.analysis or {}, name)
+    return {
+        "id": file.id,
+        "original_name": file.original_name,
+        "sha256": file.sha256,
+        "size_bytes": file.size_bytes,
+        "analysis": analysis,
+        "created_at": file.created_at,
+    }
+
+
 def safe_zip_entries(archive: zipfile.ZipFile) -> tuple[list[tuple[zipfile.ZipInfo, Path, str]], list[dict[str, str]]]:
     entries: list[tuple[zipfile.ZipInfo, Path, str]] = []
     rejected: list[dict[str, str]] = []
@@ -175,13 +197,14 @@ def persist_java(name: str, content: bytes, db: Session, user: User) -> Uploaded
     digest = hashlib.sha256(content).hexdigest()
     existing = existing_uploaded_file(db, user, digest, safe)
     if existing:
-        return existing
+        return annotate_file_source_role(existing, safe)
     folder = settings.storage_dir / "uploads" / user.id / digest[:16]
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / safe
     path.write_bytes(content)
     source = content.decode("utf-8", errors="replace")
     analysis = analyze_java_source(source, safe)
+    analysis = source_role_analysis(analysis, safe)
     object_key = f"uploads/{user.id}/{digest[:16]}/{safe}"
     stored_object = put_object(path, object_key)
     if stored_object:
@@ -214,7 +237,7 @@ def persist_project_java_record(
     display_name = relative_name if len(relative_name) <= 255 else "..." + relative_name[-252:]
     existing = existing_uploaded_file(db, user, digest, display_name, project_id=project_id, relative_name=relative_name)
     if existing:
-        return existing
+        return annotate_file_source_role(existing, relative_name)
 
     source = content.decode("utf-8", errors="replace")
     analysis = analyze_java_source(source, Path(relative_name).name)
@@ -232,6 +255,7 @@ def persist_project_java_record(
             "_project_relative_path": relative_name,
         }
     )
+    analysis = source_role_analysis(analysis, relative_name)
     record = UploadedFile(
         user_id=user.id,
         original_name=display_name,
@@ -451,7 +475,8 @@ def upload_batch(
 
 @router.get("", response_model=list[UploadedFileOut])
 def list_files(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return db.query(UploadedFile).filter(UploadedFile.user_id == user.id).order_by(UploadedFile.created_at.desc()).all()
+    rows = db.query(UploadedFile).filter(UploadedFile.user_id == user.id).order_by(UploadedFile.created_at.desc()).all()
+    return [uploaded_file_payload(row) for row in rows]
 
 
 @router.post("/delete/batch", response_model=BatchFileDeleteOut)

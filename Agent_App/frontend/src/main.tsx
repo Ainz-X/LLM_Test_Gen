@@ -129,6 +129,24 @@ type FileGroup = {
   files: UploadedFile[];
 };
 
+function javaDisplayName(file: UploadedFile) {
+  return file.analysis._project_relative_path || file.original_name;
+}
+
+function isTestSource(file: UploadedFile) {
+  const name = javaDisplayName(file);
+  return Boolean(
+    file.analysis._is_test_source ||
+      file.analysis._source_role === "test" ||
+      /(^|\/)(src\/test\/java|test_suite|tests|a3_generated)\//i.test(name.replace(/\\/g, "/")) ||
+      /(?:Test|Tests|TestCase|IT|ITCase)\.java$/.test(name)
+  );
+}
+
+function generationTargets(fileList: UploadedFile[]) {
+  return fileList.filter((file) => !isTestSource(file));
+}
+
 const emptyTask: TaskModalState = {
   open: false,
   running: false,
@@ -237,6 +255,7 @@ function App() {
     }
     return Array.from(groups.values());
   }, [files]);
+  const availableGenerationFiles = useMemo(() => generationTargets(files), [files]);
   const artifactName = (artifact: Artifact) => artifact.storage_path.split(/[\\/]/).pop() || "GeneratedTest.java";
   const uploadSummary = useMemo(() => {
     if (!pendingUploadFiles.length) return "";
@@ -378,6 +397,34 @@ function App() {
 
   async function generateForFiles(fileIds: string[], title: string, onlyMissing = true) {
     if (busy || !fileIds.length) return;
+    const requestedFiles = files.filter((file) => fileIds.includes(file.id));
+    const targetFiles = generationTargets(requestedFiles);
+    const targetIds = targetFiles.map((file) => file.id);
+    const skippedTestSources = requestedFiles.length - targetFiles.length;
+    if (!targetIds.length) {
+      setTaskModal({
+        open: true,
+        running: false,
+        kind: "generate",
+        title,
+        detail: "没有可生成测试的生产源码；已排除测试源码文件。",
+        progress: 100,
+        files: requestedFiles,
+        rejected: [],
+        result: {
+          ok: false,
+          generated_count: 0,
+          failed_count: 0,
+          skipped_count: skippedTestSources,
+          skipped: requestedFiles.map((file) => ({
+            file_id: file.id,
+            name: javaDisplayName(file),
+            reason: "test_source_skipped"
+          }))
+        }
+      });
+      return;
+    }
     const jobId =
       typeof crypto !== "undefined" && "randomUUID" in crypto
         ? crypto.randomUUID()
@@ -391,24 +438,24 @@ function App() {
       running: true,
       kind: "generate",
       title,
-      detail: `准备处理 ${fileIds.length} 个 Java 文件`,
+      detail: `准备处理 ${targetIds.length} 个生产源码${skippedTestSources ? `，已排除 ${skippedTestSources} 个测试源码` : ""}`,
       progress: 0,
       indeterminate: false,
       cancelled: false,
       jobId,
-      files: files.filter((file) => fileIds.includes(file.id)),
+      files: targetFiles,
       rejected: []
     });
     try {
       let finalResult: BatchGenerateResult | undefined;
       await streamGenerateTestsBatch(
-        fileIds,
+        targetIds,
         onlyMissing,
         jobId,
         {
           onMeta: (payload) => {
-            const total = Number(payload.total || fileIds.length);
-            const skipped = Number(payload.skipped_count || 0);
+            const total = Number(payload.total || targetIds.length);
+            const skipped = Number(payload.skipped_count || 0) + skippedTestSources;
             setTaskModal((current) => ({
               ...current,
               detail: `真实进度：待生成 ${total} 个，已跳过 ${skipped} 个`,
@@ -426,7 +473,7 @@ function App() {
           onProgress: (payload) => {
             const percent = Number(payload.percent || 0);
             const message = String(payload.message || title);
-            const total = Number(payload.total || fileIds.length);
+            const total = Number(payload.total || targetIds.length);
             const currentIndex = Number(payload.current || 0);
             const fileName = String(payload.file_name || "");
             setStatus(message);
@@ -439,7 +486,7 @@ function App() {
           },
           onItem: (payload) => {
             const generated = Number(payload.generated_count || 0);
-            const skipped = Number(payload.skipped_count || 0);
+            const skipped = Number(payload.skipped_count || 0) + skippedTestSources;
             const failed = Number(payload.failed_count || 0);
             setTaskModal((current) => ({
               ...current,
@@ -454,7 +501,7 @@ function App() {
           onDone: (payload) => {
             finalResult = payload;
             const generated = Number(payload.generated_count || 0);
-            const skipped = Number(payload.skipped_count || 0);
+            const skipped = Number(payload.skipped_count || 0) + skippedTestSources;
             const failed = Number(payload.failed_count || 0);
             setTaskModal((current) => ({
               ...current,
@@ -467,13 +514,13 @@ function App() {
           },
           onCancelled: (payload) => {
             const generated = Number(payload.generated_count || 0);
-            const skipped = Number(payload.skipped_count || 0);
+            const skipped = Number(payload.skipped_count || 0) + skippedTestSources;
             const failed = Number(payload.failed_count || 0);
             finalResult = {
               ok: false,
               cancelled: true,
               generated_count: generated,
-              skipped_count: skipped,
+              skipped_count: Number(payload.skipped_count || 0),
               failed_count: failed
             };
             setTaskModal((current) => ({
@@ -496,8 +543,20 @@ function App() {
       }
       const result: BatchGenerateResult = finalResult || { ok: true, generated_count: 0, skipped_count: 0, failed_count: 0 };
       const generated = Number(result.generated_count || 0);
-      const skipped = Number(result.skipped_count || 0);
+      const skipped = Number(result.skipped_count || 0) + skippedTestSources;
       const failed = Number(result.failed_count || 0);
+      const testSourceSkippedItems = requestedFiles
+        .filter((file) => isTestSource(file))
+        .map((file) => ({
+          file_id: file.id,
+          name: javaDisplayName(file),
+          reason: "test_source_skipped"
+        }));
+      const displayResult: BatchGenerateResult = {
+        ...result,
+        skipped_count: skipped,
+        skipped: [...((result.skipped as BatchGenerateResult["skipped"]) || []), ...testSourceSkippedItems]
+      };
       setTaskModal((current) => ({
         ...current,
         running: false,
@@ -507,7 +566,7 @@ function App() {
           ? `已中断：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个`
           : `完成：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个`,
         currentItem: "",
-        result
+        result: displayResult
       }));
       setMessages((current) => [
         ...current,
@@ -517,7 +576,7 @@ function App() {
           content: result.cancelled
             ? `批量生成已中断：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个。`
             : `已完成批量生成：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个。`,
-          tool_results: { items: [result] },
+          tool_results: { items: [displayResult] },
           created_at: new Date().toISOString()
         }
       ]);
@@ -548,8 +607,8 @@ function App() {
   }
 
   async function batchGenerateMissingTests() {
-    const targetIds = selectedFileIds.length ? selectedFileIds : files.map((file) => file.id);
-    const label = selectedFileIds.length ? "为已选 Java 生成未测测试" : "为全部 Java 生成未测测试";
+    const targetIds = selectedFileIds.length ? selectedFileIds : availableGenerationFiles.map((file) => file.id);
+    const label = selectedFileIds.length ? "为已选生产源码生成未测测试" : "为全部生产源码生成未测测试";
     await generateForFiles(targetIds, label, true);
   }
 
@@ -1033,7 +1092,12 @@ function App() {
                 <button type="button" title={text.deleteSelectedFiles} onClick={deleteSelectedFiles} disabled={!selectedFileIds.length || busy}>
                   删除已选
                 </button>
-                <button type="button" title="为已选或全部未生成测试的 Java 文件生成测试" onClick={batchGenerateMissingTests} disabled={!files.length || busy}>
+                <button
+                  type="button"
+                  title="为已选或全部未生成测试的生产源码生成测试"
+                  onClick={batchGenerateMissingTests}
+                  disabled={busy || (!selectedFileIds.length && !availableGenerationFiles.length)}
+                >
                   {text.batchGenerateMissing}
                 </button>
               </div>
@@ -1043,7 +1107,7 @@ function App() {
                     <div className="project-header">
                       <div>
                         <strong>{group.name}</strong>
-                        <span>{group.files.length} 个 Java{group.buildTool ? ` · ${group.buildTool}` : ""}</span>
+                        <span>{generationTargets(group.files).length} 个可生成 / {group.files.length} 个 Java{group.buildTool ? ` · ${group.buildTool}` : ""}</span>
                       </div>
                       {group.id !== "loose" && (
                         <div className="project-actions">
@@ -1060,8 +1124,8 @@ function App() {
                             className="project-action-btn"
                             type="button"
                             title="生成当前项目未测测试"
-                            onClick={() => generateForFiles(group.files.map((file) => file.id), `为项目 ${group.name} 生成未测测试`, true)}
-                            disabled={busy}
+                            onClick={() => generateForFiles(generationTargets(group.files).map((file) => file.id), `为项目 ${group.name} 生成未测测试`, true)}
+                            disabled={busy || !generationTargets(group.files).length}
                           >
                             生成
                           </button>
@@ -1069,7 +1133,7 @@ function App() {
                       )}
                     </div>
                     {group.files.map((file) => (
-                      <div className={`file-row ${file.id === activeFileId ? "selected" : ""}`} key={file.id}>
+                      <div className={`file-row ${file.id === activeFileId ? "selected" : ""} ${isTestSource(file) ? "test-source" : ""}`} key={file.id}>
                         <input
                           aria-label={file.original_name}
                           checked={selectedFileIds.includes(file.id)}
@@ -1077,15 +1141,18 @@ function App() {
                           type="checkbox"
                         />
                         <button className="list-item" onClick={() => setActiveFileId(file.id)}>
-                          <strong>{file.analysis._project_relative_path || file.original_name}</strong>
-                          <span>{file.analysis.class_name || "Unknown"} - {file.analysis.method_count || 0} {text.methods}</span>
+                          <strong>{javaDisplayName(file)}</strong>
+                          <span className="file-meta">
+                            <span>{file.analysis.class_name || "Unknown"} - {file.analysis.method_count || 0} {text.methods}</span>
+                            <span className={`source-tag ${isTestSource(file) ? "test" : "prod"}`}>{isTestSource(file) ? "测试源码" : "生产源码"}</span>
+                          </span>
                         </button>
                         <button
                           className="mini-icon-btn"
                           type="button"
-                          title="为这个 Java 文件生成测试"
+                          title={isTestSource(file) ? "这是测试源码，不生成 TestTest" : "为这个 Java 文件生成测试"}
                           onClick={() => generateForFiles([file.id], `为 ${file.original_name} 生成测试`, false)}
-                          disabled={busy}
+                          disabled={busy || isTestSource(file)}
                         >
                           <Bot size={15} />
                         </button>
@@ -1158,10 +1225,11 @@ function App() {
                 {!!taskModal.files.length && !taskModal.running && !taskModal.result && (
                   <button
                     type="button"
-                    onClick={() => generateForFiles(taskModal.files.map((file) => file.id), "为上传项目生成未测测试", true)}
+                    onClick={() => generateForFiles(generationTargets(taskModal.files).map((file) => file.id), "为上传项目生成未测测试", true)}
+                    disabled={!generationTargets(taskModal.files).length}
                   >
                     <Bot size={15} />
-                    生成这些 Java
+                    生成生产源码
                   </button>
                 )}
                 {taskModal.running && taskModal.jobId && (
@@ -1206,8 +1274,11 @@ function App() {
                           if (!taskModal.running) setTaskModal(emptyTask);
                         }}
                       >
-                        <strong>{file.analysis._project_relative_path || file.original_name}</strong>
-                        <span>{file.analysis.class_name || "Unknown"} · {file.analysis.method_count || 0} {text.methods}</span>
+                        <strong>{javaDisplayName(file)}</strong>
+                        <span>
+                          {file.analysis.class_name || "Unknown"} · {file.analysis.method_count || 0} {text.methods}
+                          {isTestSource(file) ? " · 测试源码" : " · 生产源码"}
+                        </span>
                       </button>
                     ))}
                   </div>

@@ -22,6 +22,7 @@ from app.services import a3_tools
 from app.services.code_context_service import build_code_context, format_code_context_answer, infer_context_field
 from app.services.java_analysis import junit4_scaffold
 from app.services.prompt_service import render_generation_prompt, render_repair_prompt
+from app.services.source_selection import file_source_name, is_uploaded_test_source, source_role_analysis, test_source_reason
 from app.services.storage_service import put_object
 
 
@@ -38,6 +39,18 @@ def truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + f"\n... <truncated {len(text) - max_chars} chars>"
+
+
+def process_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def process_output(stdout: str | bytes | None, stderr: str | bytes | None) -> str:
+    return process_text(stdout) + process_text(stderr)
 
 
 def artifact_summary(artifact: GeneratedArtifact) -> dict[str, Any]:
@@ -623,6 +636,20 @@ class AgentService:
 
     def tool_generate_tests(self, args: dict[str, Any], cancel_check: Callable[[], bool] | None = None) -> dict[str, Any]:
         file = self._owned_file(args["file_id"])
+        if is_uploaded_test_source(file) and not args.get("allow_test_source"):
+            return {
+                "ok": False,
+                "tool": "generate_tests",
+                "available": True,
+                "reason": "当前文件被识别为测试源码，不会再为测试文件生成 TestTest。请切换到 src/main/java 下的生产源码后再生成。",
+                "source_file": {
+                    "id": file.id,
+                    "name": file_source_name(file) or file.original_name,
+                    "class_name": (file.analysis or {}).get("class_name"),
+                    "source_role": "test",
+                    "test_source_reason": test_source_reason(file),
+                },
+            }
         source = Path(file.storage_path).read_text(encoding="utf-8", errors="replace")
         goal = args.get("goal") or "Generate JUnit 4 tests with edge cases and exception paths."
         model_used = ""
@@ -731,6 +758,15 @@ class AgentService:
         selected: list[UploadedFile] = []
         skipped: list[dict[str, Any]] = []
         for row in rows:
+            if is_uploaded_test_source(row):
+                skipped.append(
+                    {
+                        "file_id": row.id,
+                        "name": file_source_name(row) or row.original_name,
+                        "reason": "test_source_skipped",
+                    }
+                )
+                continue
             if only_missing and self.has_test_artifact(row.id):
                 skipped.append({"file_id": row.id, "name": row.original_name, "reason": "already_has_test_artifact"})
                 continue
@@ -772,7 +808,7 @@ class AgentService:
             has_artifact = self.has_test_artifact(row.id)
             if only_missing and has_artifact:
                 continue
-            analysis = row.analysis or {}
+            analysis = source_role_analysis(row.analysis or {}, file_source_name(row) or row.original_name)
             files.append(
                 {
                     "id": row.id,
@@ -780,6 +816,10 @@ class AgentService:
                     "class_name": analysis.get("class_name"),
                     "package": analysis.get("package"),
                     "method_count": analysis.get("method_count"),
+                    "relative_path": analysis.get("_project_relative_path"),
+                    "source_role": analysis.get("_source_role"),
+                    "is_test_source": analysis.get("_is_test_source"),
+                    "test_source_reason": analysis.get("_test_source_reason"),
                     "has_test_artifact": has_artifact,
                 }
             )
@@ -860,9 +900,31 @@ class AgentService:
             "summary": summarize_test_code(file, artifact, code),
         }
 
+    def test_source_tool_rejection(self, tool: str, file: UploadedFile, artifact: GeneratedArtifact | None = None) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "ok": False,
+            "tool": tool,
+            "available": True,
+            "stage": "source_selection",
+            "reason": "当前文件被识别为测试源码，不能作为生成/编译/覆盖率目标。请选择 src/main/java 下的生产源码。",
+            "diagnosis": "目标文件属于测试源码；继续执行会生成 TestTest 或对测试代码统计覆盖率，结果没有意义。",
+            "source_file": {
+                "id": file.id,
+                "name": file_source_name(file) or file.original_name,
+                "class_name": (file.analysis or {}).get("class_name"),
+                "source_role": "test",
+                "test_source_reason": test_source_reason(file),
+            },
+        }
+        if artifact:
+            result["artifact"] = artifact_summary(artifact)
+        return result
+
     def tool_compile_artifact(self, args: dict[str, Any]) -> dict[str, Any]:
         artifact = self._owned_artifact(args["artifact_id"])
         file = self._owned_file(artifact.file_id)
+        if is_uploaded_test_source(file):
+            return self.test_source_tool_rejection("compile_artifact", file, artifact)
         if not settings.enable_java_compile:
             return {
                 "ok": False,
@@ -901,7 +963,7 @@ class AgentService:
                     "tool": "compile_artifact",
                     "available": True,
                     "return_code": None,
-                    "output": truncate((exc.stdout or "") + (exc.stderr or ""), 12000),
+                    "output": truncate(process_output(exc.stdout, exc.stderr), 12000),
                     "reason": f"javac timed out after {settings.compile_timeout_seconds} seconds.",
                     "artifact": artifact_summary(artifact),
                 }
@@ -921,6 +983,8 @@ class AgentService:
     def tool_run_coverage(self, args: dict[str, Any]) -> dict[str, Any]:
         artifact = self._owned_artifact(args["artifact_id"])
         file = self._owned_file(artifact.file_id)
+        if is_uploaded_test_source(file):
+            return self.test_source_tool_rejection("run_coverage", file, artifact)
         if not settings.enable_java_coverage:
             return {
                 "ok": False,
@@ -1721,6 +1785,15 @@ class AgentService:
             return
         yield {"event": "status", "message": "5%：正在查找当前文件的最新测试产物...", "stage": "lookup", "percent": 5}
         file = self._owned_file(file_id)
+        if is_uploaded_test_source(file):
+            result = self.test_source_tool_rejection("run_coverage", file)
+            compact = compact_tool_result(result)
+            self.record_tool(conversation_id, "run_coverage", {"file_id": file_id}, compact)
+            yield {"event": "tool", "data": compact}
+            reply = "当前选中的是测试源码，不适合作为覆盖率目标。请切换到 src/main/java 下的生产源码后再运行覆盖率。"
+            for index in range(0, len(reply), 18):
+                yield {"event": "delta", "text": reply[index : index + 18]}
+            return
         latest = self.latest_artifact_for_file(file_id)
         if latest is None:
             result = self.tool_list_artifacts({"file_id": file_id})
@@ -2064,15 +2137,31 @@ class AgentService:
             target = work_project / test_rel_path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(code, encoding="utf-8")
-            command = [mvn, "-q", "-Dmaven.compiler.source=1.8", "-Dmaven.compiler.target=1.8", "-DskipTests", "test-compile"]
-            completed = subprocess.run(
-                command,
-                cwd=work_project,
-                capture_output=True,
-                text=True,
-                timeout=max(settings.compile_timeout_seconds, 120),
-                check=False,
-            )
+            command = [mvn, "-B", "-Dmaven.compiler.source=1.8", "-Dmaven.compiler.target=1.8", "-DskipTests", "test-compile"]
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=work_project,
+                    capture_output=True,
+                    text=True,
+                    timeout=settings.maven_compile_timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                output = process_output(exc.stdout, exc.stderr)
+                return {
+                    "ok": False,
+                    "tool": "compile_artifact",
+                    "available": True,
+                    "return_code": None,
+                    "output": truncate(output, 12000),
+                    "diagnosis": f"Maven 编译超时：超过 {settings.maven_compile_timeout_seconds} 秒。首次构建可能在下载依赖，稍后重试通常会更快。",
+                    "artifact": artifact_summary(artifact),
+                    "test_class": test_class,
+                    "source_scope": "maven_project",
+                    "project_root": str(project_root),
+                    "elapsed_seconds": settings.maven_compile_timeout_seconds,
+                }
             output = (completed.stdout or "") + (completed.stderr or "")
             return {
                 "ok": completed.returncode == 0,
@@ -2105,7 +2194,7 @@ class AgentService:
             target.write_text(code, encoding="utf-8")
             base_command = [
                 mvn,
-                "-q",
+                "-B",
                 "-Dmaven.compiler.source=1.8",
                 "-Dmaven.compiler.target=1.8",
             ]
@@ -2113,7 +2202,7 @@ class AgentService:
             compile_result = yield from self.run_process_with_progress(
                 [*base_command, "-DskipTests", "test-compile"],
                 work_project,
-                max(settings.compile_timeout_seconds, 120),
+                settings.maven_compile_timeout_seconds,
                 "maven_compile",
                 "Maven 正在编译项目和测试依赖",
                 35,
@@ -2138,7 +2227,7 @@ class AgentService:
             test_result = yield from self.run_process_with_progress(
                 [*base_command, "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent", "test"],
                 work_project,
-                max(settings.test_timeout_seconds, 180),
+                settings.maven_test_timeout_seconds,
                 "maven_test",
                 "Maven 正在运行 JUnit 并采集 JaCoCo exec 数据",
                 70,
@@ -2163,7 +2252,7 @@ class AgentService:
             report_result = yield from self.run_process_with_progress(
                 [*base_command, "org.jacoco:jacoco-maven-plugin:0.8.12:report"],
                 work_project,
-                max(settings.test_timeout_seconds, 120),
+                settings.maven_report_timeout_seconds,
                 "jacoco_report",
                 "JaCoCo 正在生成覆盖率报告",
                 90,
@@ -2221,21 +2310,37 @@ class AgentService:
             target.write_text(code, encoding="utf-8")
             command = [
                 mvn,
-                "-q",
+                "-B",
                 "-Dmaven.compiler.source=1.8",
                 "-Dmaven.compiler.target=1.8",
                 "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent",
                 "test",
                 "org.jacoco:jacoco-maven-plugin:0.8.12:report",
             ]
-            completed = subprocess.run(
-                command,
-                cwd=work_project,
-                capture_output=True,
-                text=True,
-                timeout=max(settings.test_timeout_seconds, 180),
-                check=False,
-            )
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=work_project,
+                    capture_output=True,
+                    text=True,
+                    timeout=settings.maven_test_timeout_seconds + settings.maven_report_timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                output = process_output(exc.stdout, exc.stderr)
+                return {
+                    "ok": False,
+                    "tool": "run_coverage",
+                    "available": True,
+                    "stage": "maven",
+                    "return_code": None,
+                    "output": truncate(output, 12000),
+                    "diagnosis": f"Maven 覆盖率执行超时：超过 {settings.maven_test_timeout_seconds + settings.maven_report_timeout_seconds} 秒。建议使用流式覆盖率入口查看分阶段进度。",
+                    "artifact": artifact_summary(artifact),
+                    "test_class": test_class,
+                    "source_scope": "maven_project",
+                    "project_root": str(project_root),
+                }
             output = (completed.stdout or "") + (completed.stderr or "")
             if completed.returncode != 0:
                 return {

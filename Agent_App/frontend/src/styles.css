@@ -271,6 +271,10 @@ textarea:focus {
   grid-template-columns: 20px minmax(0, 1fr) 34px;
 }
 
+.file-row.test-source .list-item {
+  background: #f8fafc;
+}
+
 .artifact-row {
   grid-template-columns: minmax(0, 1fr) 34px 34px;
 }
@@ -362,6 +366,36 @@ textarea:focus {
   color: var(--muted);
   font-size: 12px;
   overflow-wrap: anywhere;
+}
+
+.file-meta {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.source-tag {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.source-tag.prod {
+  color: #0f766e;
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+}
+
+.source-tag.test {
+  color: #64748b;
+  background: #f1f5f9;
 }
 
 .chat-workspace {

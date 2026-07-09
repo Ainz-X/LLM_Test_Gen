@@ -44,6 +44,9 @@ class Settings:
     )
     compile_timeout_seconds = int(os.getenv("COMPILE_TIMEOUT_SECONDS", "20"))
     test_timeout_seconds = int(os.getenv("TEST_TIMEOUT_SECONDS", "40"))
+    maven_compile_timeout_seconds = int(os.getenv("MAVEN_COMPILE_TIMEOUT_SECONDS", "300"))
+    maven_test_timeout_seconds = int(os.getenv("MAVEN_TEST_TIMEOUT_SECONDS", "300"))
+    maven_report_timeout_seconds = int(os.getenv("MAVEN_REPORT_TIMEOUT_SECONDS", "180"))
     context_extract_timeout_seconds = int(os.getenv("CONTEXT_EXTRACT_TIMEOUT_SECONDS", "300"))
     minio_enabled = os.getenv("MINIO_ENABLED", "0") == "1"
     minio_endpoint = os.getenv("MINIO_ENDPOINT", "localhost:9000")

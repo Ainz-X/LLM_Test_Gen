@@ -26,6 +26,9 @@ export type UploadedFile = {
     _project_name?: string;
     _project_build_tool?: string;
     _project_relative_path?: string;
+    _source_role?: "production" | "test";
+    _is_test_source?: boolean;
+    _test_source_reason?: string;
     suggested_test_targets?: Array<{ name: string; parameters?: string; return_type?: string }>;
   };
   created_at: string;
