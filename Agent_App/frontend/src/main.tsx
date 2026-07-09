@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import {
   BarChart3,
   Bot,
+  Database,
   Download,
   Eye,
   FileArchive,
@@ -22,17 +23,20 @@ import {
 } from "lucide-react";
 import {
   Artifact,
+  AgentJob,
   BatchGenerateResult,
   Conversation,
   Message,
   UploadedFile,
   cancelBatchGenerate,
+  cancelJob,
   createConversation,
   deleteConversation,
   deleteUploadedFile,
   deleteUploadedFiles,
   downloadArtifact,
   downloadArtifactsZip,
+  extractCodeContext,
   getArtifacts,
   getConversations,
   getFiles,
@@ -44,6 +48,7 @@ import {
   readArtifact,
   register,
   streamGenerateTestsBatch,
+  streamJob,
   streamChat,
   uploadJavaBatch
 } from "./api";
@@ -78,6 +83,7 @@ const text = {
   deleteSelectedFiles: "\u6279\u91cf\u5220",
   selectAll: "\u5168\u9009",
   batchGenerateMissing: "\u751f\u6210\u672a\u6d4b",
+  extractContext: "提取上下文",
   deleteConversation: "\u5220\u9664\u5bf9\u8bdd",
   methods: "\u4e2a\u65b9\u6cd5",
   artifacts: "\u751f\u6210\u4ea7\u7269",
@@ -94,6 +100,7 @@ const text = {
 
 const suggestions = [
   "\u4e3a\u5f53\u524d Java \u6587\u4ef6\u751f\u6210 JUnit 4 \u6d4b\u8bd5",
+  "当前代码的 Jimple Code 是什么",
   "\u770b\u770b\u4e4b\u524d\u751f\u6210\u7684\u6d4b\u8bd5\u4e3a\u4ec0\u4e48\u7f16\u8bd1\u4e0d\u8fc7",
   "\u4fee\u590d\u5f53\u524d\u6587\u4ef6\u6700\u65b0\u751f\u6210\u7684\u6d4b\u8bd5",
   "\u8fd0\u884c\u5f53\u524d\u6587\u4ef6\u6700\u65b0\u6d4b\u8bd5\u7684 JaCoCo \u8986\u76d6\u7387",
@@ -103,6 +110,7 @@ const suggestions = [
 type TaskModalState = {
   open: boolean;
   running: boolean;
+  kind?: "upload" | "generate" | "context";
   title: string;
   detail: string;
   progress: number;
@@ -111,7 +119,7 @@ type TaskModalState = {
   jobId?: string;
   files: UploadedFile[];
   rejected: Array<{ name: string; reason: string }>;
-  result?: BatchGenerateResult;
+  result?: BatchGenerateResult & { context_rows?: number; file_count?: number; groups?: unknown[] };
 };
 
 type FileGroup = {
@@ -210,6 +218,7 @@ function App() {
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const chatAbortRef = useRef<AbortController | null>(null);
   const batchAbortRef = useRef<{ controller: AbortController; jobId: string } | null>(null);
+  const contextAbortRef = useRef<{ controller: AbortController; jobId: string } | null>(null);
 
   const activeFile = useMemo(() => files.find((file) => file.id === activeFileId), [files, activeFileId]);
   const activeProjectId = activeFile?.analysis._project_id;
@@ -396,6 +405,7 @@ function App() {
     setTaskModal({
       open: true,
       running: true,
+      kind: "generate",
       title,
       detail: `准备处理 ${fileIds.length} 个 Java 文件`,
       progress: 0,
@@ -550,6 +560,138 @@ function App() {
     await generateForFiles(targetIds, label, true);
   }
 
+  async function extractContextForFiles(fileIds: string[], title: string) {
+    if (busy || !fileIds.length) return;
+    const controller = new AbortController();
+    setBusy(true);
+    setStatus(title);
+    setTaskModal({
+      open: true,
+      running: true,
+      kind: "context",
+      title,
+      detail: `正在提交 ${fileIds.length} 个 Java 文件的上下文提取任务`,
+      progress: 0,
+      indeterminate: false,
+      cancelled: false,
+      files: files.filter((file) => fileIds.includes(file.id)),
+      rejected: []
+    });
+    try {
+      const job = await extractCodeContext(fileIds);
+      contextAbortRef.current = { controller, jobId: job.id };
+      setTaskModal((current) => ({
+        ...current,
+        jobId: job.id,
+        progress: job.progress || 0,
+        detail: job.message || "任务已加入后台队列"
+      }));
+      let finalJob: AgentJob | undefined;
+      await streamJob(
+        job.id,
+        {
+          onProgress: (payload) => {
+            setStatus(payload.message || title);
+            setTaskModal((current) => ({
+              ...current,
+              progress: Math.max(0, Math.min(100, Number(payload.progress || 0))),
+              detail: payload.message || current.detail
+            }));
+          },
+          onDone: (payload) => {
+            finalJob = payload;
+            const result = payload.result_json || {};
+            const rows = Number(result.context_rows || 0);
+            const fileCount = Number(result.file_count || fileIds.length);
+            const failed = payload.status === "failed";
+            setTaskModal((current) => ({
+              ...current,
+              running: false,
+              cancelled: payload.status === "cancelled",
+              progress: 100,
+              detail: failed ? payload.error || payload.message || "上下文提取失败" : payload.message || "上下文提取完成",
+              result: {
+                ok: payload.status === "succeeded",
+                context_rows: rows,
+                file_count: fileCount,
+                failed_count: failed ? 1 : 0,
+                generated_count: 0,
+                skipped_count: 0,
+                groups: result.groups as unknown[] | undefined
+              }
+            }));
+          },
+          onError: (payload) => {
+            throw new Error(String(payload.detail || "上下文提取失败"));
+          }
+        },
+        controller.signal
+      );
+      if (controller.signal.aborted) {
+        setTaskModal((current) => ({
+          ...current,
+          running: false,
+          cancelled: true,
+          detail: "已请求中断；worker 会在当前安全检查点停止"
+        }));
+        return;
+      }
+      const result = finalJob?.result_json || {};
+      const rows = Number(result.context_rows || 0);
+      setMessages((current) => [
+        ...current,
+        {
+          id: `local-context-${Date.now()}`,
+          role: "assistant",
+          content:
+            finalJob?.status === "succeeded"
+              ? `上下文提取完成：处理 ${result.file_count || fileIds.length} 个 Java 文件，写入/复用 ${rows} 行方法级上下文。现在可以问我当前代码的 Jimple Code、FQN、Method Source 等。`
+              : `上下文提取结束：${finalJob?.message || "任务未成功完成"}`,
+          tool_results: { items: [finalJob || job] },
+          created_at: new Date().toISOString()
+        }
+      ]);
+      await refresh();
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setTaskModal((current) => ({
+          ...current,
+          running: false,
+          cancelled: true,
+          detail: "已请求中断；worker 会在当前安全检查点停止"
+        }));
+        return;
+      }
+      setTaskModal((current) => ({
+        ...current,
+        running: false,
+        progress: 100,
+        detail: err instanceof Error ? err.message : "上下文提取失败",
+        result: { ok: false, failed_count: 1 }
+      }));
+    } finally {
+      contextAbortRef.current = null;
+      setBusy(false);
+      setStatus("");
+    }
+  }
+
+  async function extractContextForCurrentSelection() {
+    const targetIds = selectedFileIds.length
+      ? selectedFileIds
+      : activeProjectFiles.length
+        ? activeProjectFiles.map((file) => file.id)
+        : activeFileId
+          ? [activeFileId]
+          : files.map((file) => file.id);
+    const label = selectedFileIds.length
+      ? "提取已选 Java 上下文"
+      : activeProjectFiles.length
+        ? "提取当前项目上下文"
+        : "提取 Java 上下文";
+    await extractContextForFiles(targetIds, label);
+  }
+
   async function submitChat(event?: FormEvent, preset?: string) {
     event?.preventDefault();
     const message = (preset ?? input).trim();
@@ -635,6 +777,7 @@ function App() {
     setTaskModal({
       open: true,
       running: true,
+      kind: "upload",
       title: hasZip ? "上传并解析项目 zip" : "上传 Java 文件",
       detail: `正在上传 ${accepted.length} 个文件`,
       progress: 8,
@@ -691,6 +834,16 @@ function App() {
       setTaskModal((current) =>
         current.open && current.running
           ? { ...current, running: false, cancelled: true, detail: "已请求中断；后端会停止继续处理后续文件" }
+          : current
+      );
+    }
+    const context = contextAbortRef.current;
+    if (context) {
+      cancelJob(context.jobId).catch(console.error);
+      context.controller.abort();
+      setTaskModal((current) =>
+        current.open && current.running
+          ? { ...current, running: false, cancelled: true, detail: "已请求中断；worker 会在当前安全检查点停止" }
           : current
       );
     }
@@ -779,7 +932,7 @@ function App() {
               <Bot size={17} />
               {text.generate}
             </button>
-            <button type="button" onClick={() => submitChat(undefined, suggestions[3])} disabled={!activeFileId || busy}>
+            <button type="button" onClick={() => submitChat(undefined, suggestions[4])} disabled={!activeFileId || busy}>
               <BarChart3 size={17} />
               {text.coverage}
             </button>
@@ -878,6 +1031,10 @@ function App() {
                   <Trash2 size={15} />
                   {text.deleteFile}
                 </button>
+                <button type="button" title="为已选、当前项目或全部 Java 文件提取 Jimple/FQN/方法上下文" onClick={extractContextForCurrentSelection} disabled={!files.length || busy}>
+                  <Database size={15} />
+                  {text.extractContext}
+                </button>
                 {activeProjectFiles.length > 1 && (
                   <button
                     type="button"
@@ -903,14 +1060,24 @@ function App() {
                         <span>{group.files.length} 个 Java{group.buildTool ? ` · ${group.buildTool}` : ""}</span>
                       </div>
                       {group.id !== "loose" && (
-                        <button
-                          className="mini-text-btn"
-                          type="button"
-                          onClick={() => generateForFiles(group.files.map((file) => file.id), `为项目 ${group.name} 生成未测测试`, true)}
-                          disabled={busy}
-                        >
-                          生成项目未测
-                        </button>
+                        <div className="project-actions">
+                          <button
+                            className="mini-text-btn"
+                            type="button"
+                            onClick={() => extractContextForFiles(group.files.map((file) => file.id), `提取项目 ${group.name} 上下文`)}
+                            disabled={busy}
+                          >
+                            提取上下文
+                          </button>
+                          <button
+                            className="mini-text-btn"
+                            type="button"
+                            onClick={() => generateForFiles(group.files.map((file) => file.id), `为项目 ${group.name} 生成未测测试`, true)}
+                            disabled={busy}
+                          >
+                            生成项目未测
+                          </button>
+                        </div>
                       )}
                     </div>
                     {group.files.map((file) => (
@@ -1068,13 +1235,21 @@ function App() {
 
               {taskModal.result && (
                 <section className="task-panel">
-                  <div className="section-title">生成结果</div>
-                  <div className="result-grid">
-                    <div><strong>{taskModal.result.generated_count || 0}</strong><span>已生成</span></div>
-                    <div><strong>{taskModal.result.skipped_count || 0}</strong><span>已跳过</span></div>
-                    <div><strong>{taskModal.result.failed_count || 0}</strong><span>失败</span></div>
-                  </div>
-                  {!!taskModal.result.failed?.length && (
+                  <div className="section-title">{taskModal.kind === "context" ? "提取结果" : "生成结果"}</div>
+                  {taskModal.kind === "context" ? (
+                    <div className="result-grid">
+                      <div><strong>{taskModal.result.file_count || 0}</strong><span>文件</span></div>
+                      <div><strong>{taskModal.result.context_rows || 0}</strong><span>上下文行</span></div>
+                      <div><strong>{taskModal.result.failed_count || 0}</strong><span>失败</span></div>
+                    </div>
+                  ) : (
+                    <div className="result-grid">
+                      <div><strong>{taskModal.result.generated_count || 0}</strong><span>已生成</span></div>
+                      <div><strong>{taskModal.result.skipped_count || 0}</strong><span>已跳过</span></div>
+                      <div><strong>{taskModal.result.failed_count || 0}</strong><span>失败</span></div>
+                    </div>
+                  )}
+                  {taskModal.kind !== "context" && !!taskModal.result.failed?.length && (
                     <div className="task-file-list">
                       {taskModal.result.failed.map((item) => (
                         <div className="task-file-row static" key={`${item.file_id}-${item.error}`}>

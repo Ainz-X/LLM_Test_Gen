@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import time
 import uuid
 import zipfile
 from pathlib import Path
@@ -15,20 +16,23 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db import get_db
-from app.models import Conversation, GeneratedArtifact, UploadedFile, User
+from app.models import AgentJob, CodeContext, Conversation, GeneratedArtifact, UploadedFile, User
 from app.schemas import (
+    AgentJobOut,
     ArtifactOut,
     ArtifactReadOut,
     BatchFileDeleteIn,
     BatchFileDeleteOut,
     BatchGenerateIn,
     BatchUploadOut,
+    ContextExtractIn,
     UploadedFileOut,
 )
 from app.security import get_current_user
 from app.services.agent_service import AgentService, GenerationCancelled
 from app.services.java_analysis import analyze_java_source
 from app.services.storage_service import put_object, remove_object
+from app.tasks.context_extraction import extract_code_context_task
 
 
 router = APIRouter(prefix="/files", tags=["files"])
@@ -49,6 +53,25 @@ ZIP_IGNORED_DIRS = {
 
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+
+def job_payload(job: AgentJob) -> dict[str, object]:
+    return {
+        "id": job.id,
+        "kind": job.kind,
+        "status": job.status,
+        "progress": job.progress,
+        "stage": job.stage,
+        "message": job.message,
+        "request_json": job.request_json or {},
+        "result_json": job.result_json or {},
+        "error": job.error,
+        "cancel_requested": job.cancel_requested,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+    }
 
 
 def safe_name(name: str) -> str:
@@ -366,6 +389,11 @@ def delete_file_record(file: UploadedFile, db: Session, user: User) -> int:
         .filter(Conversation.user_id == user.id, Conversation.active_file_id == file.id)
         .update({Conversation.active_file_id: None}, synchronize_session=False)
     )
+    (
+        db.query(CodeContext)
+        .filter(CodeContext.user_id == user.id, CodeContext.file_id == file.id)
+        .update({CodeContext.file_id: None}, synchronize_session=False)
+    )
     db.delete(file)
     return len(artifacts)
 
@@ -653,6 +681,124 @@ def generate_tests_batch_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def context_target_files(payload: ContextExtractIn, db: Session, user: User) -> list[UploadedFile]:
+    query = db.query(UploadedFile).filter(UploadedFile.user_id == user.id)
+    if payload.file_ids:
+        rows = query.filter(UploadedFile.id.in_(payload.file_ids)).order_by(UploadedFile.created_at.asc()).all()
+        found = {row.id for row in rows}
+        missing = [file_id for file_id in payload.file_ids if file_id not in found]
+        if missing:
+            raise HTTPException(status_code=404, detail=f"Files not found: {', '.join(missing[:5])}")
+        return rows
+    rows = query.order_by(UploadedFile.created_at.asc()).all()
+    if payload.project_id:
+        rows = [row for row in rows if (row.analysis or {}).get("_project_id") == payload.project_id]
+    return rows
+
+
+@router.post("/context/extract", response_model=AgentJobOut)
+def extract_context(
+    payload: ContextExtractIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    rows = context_target_files(payload, db, user)
+    if not rows:
+        raise HTTPException(status_code=400, detail="No Java files selected for context extraction")
+    project_ids = sorted({(row.analysis or {}).get("_project_id") or f"loose:{row.id}" for row in rows})
+    job = AgentJob(
+        user_id=user.id,
+        kind="code_context_extraction",
+        status="queued",
+        progress=0,
+        stage="queued",
+        message=f"已加入后台队列，等待提取 {len(rows)} 个 Java 文件的上下文。",
+        request_json={
+            "file_ids": [row.id for row in rows],
+            "project_id": payload.project_id,
+            "project_ids": project_ids,
+        },
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    try:
+        task = extract_code_context_task.delay(job.id)
+        job.external_id = task.id
+        db.commit()
+        db.refresh(job)
+    except Exception as exc:
+        job.status = "failed"
+        job.progress = 100
+        job.stage = "queue_failed"
+        job.message = "提交后台任务失败，请确认 Redis/Celery worker 已启动。"
+        job.error = f"{type(exc).__name__}: {exc}"
+        db.commit()
+        raise HTTPException(status_code=503, detail=job.message) from exc
+    return job
+
+
+@router.get("/jobs/{job_id}", response_model=AgentJobOut)
+def get_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    job = db.get(AgentJob, job_id)
+    if not job or job.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@router.get("/jobs/{job_id}/stream")
+def stream_job(job_id: str, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    job = db.get(AgentJob, job_id)
+    if not job or job.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    def client_disconnected() -> bool:
+        try:
+            return anyio.from_thread.run(request.is_disconnected)
+        except RuntimeError:
+            return False
+
+    def generate():
+        terminal = {"succeeded", "failed", "cancelled"}
+        while True:
+            db.refresh(job)
+            payload = job_payload(job)
+            yield sse("progress", payload)
+            if job.status in terminal:
+                yield sse("done", payload)
+                return
+            if client_disconnected():
+                return
+            time.sleep(1)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    job = db.get(AgentJob, job_id)
+    if not job or job.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job.cancel_requested = True
+    if job.status == "queued":
+        job.status = "cancelled"
+        job.progress = 100
+        job.stage = "cancelled"
+        job.message = "任务已在队列阶段取消。"
+    else:
+        job.message = "已请求中断；worker 会在当前安全检查点停止。"
+    db.commit()
+    try:
+        extract_code_context_task.app.control.revoke(job.external_id, terminate=False)
+    except Exception:
+        pass
+    return {"ok": True, "job_id": job.id, "cancel_requested": True, "status": job.status}
 
 
 @router.get("/{file_id}/artifacts", response_model=list[ArtifactOut])

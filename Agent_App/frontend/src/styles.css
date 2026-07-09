@@ -300,6 +300,14 @@ textarea:focus {
   min-width: 0;
 }
 
+.project-header .project-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .project-header strong {
   overflow-wrap: anywhere;
   font-size: 13px;

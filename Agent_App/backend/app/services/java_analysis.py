@@ -99,8 +99,9 @@ def analyze_java_source(source: str, file_name: str) -> dict[str, Any]:
     )
     class_name = class_match.group(1) if class_match else Path(file_name).stem
     method_pattern = re.compile(
-        r"(?P<prefix>(?:public|protected|private|static|final|synchronized|abstract|native|strictfp|\s)+)"
-        r"(?P<return>[A-Za-z_$][\w$<>\[\].?,\s]*?)\s+"
+        r"^\s*(?:@\w+(?:\([^)]*\))?\s*)*"
+        r"(?P<prefix>(?:(?:public|protected|private|static|final|synchronized|abstract|native|strictfp)\s+)*)"
+        r"(?P<return>[A-Za-z_$][\w$<>\[\].?,]*(?:\s+[A-Za-z_$][\w$<>\[\].?,]*)*)\s+"
         r"(?P<name>[A-Za-z_$][\w$]*)\s*"
         r"\((?P<params>[^()]*)\)\s*"
         r"(?P<throws>throws\s+[^{;]+)?(?P<body>[{;])",

@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -18,7 +19,9 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models import AgentMemory, GeneratedArtifact, MessageFeedback, ToolCall, UploadedFile, User
 from app.services import a3_tools
+from app.services.code_context_service import build_code_context, format_code_context_answer, infer_context_field
 from app.services.java_analysis import junit4_scaffold
+from app.services.prompt_service import render_generation_prompt, render_repair_prompt
 from app.services.storage_service import put_object
 
 
@@ -348,6 +351,30 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
         "结构",
         "分析",
     ]
+    code_context_tokens = [
+        "fqn",
+        "fnq",
+        "fully qualified",
+        "qualified name",
+        "全限定名",
+        "jimple",
+        "中间表示",
+        "字节码",
+        "signature",
+        "签名",
+        "method source",
+        "方法源码",
+        "源码",
+        "field context",
+        "字段上下文",
+        "constructor",
+        "helper",
+        "构造",
+        "辅助方法",
+        "throws",
+        "modifiers",
+        "修饰符",
+    ]
 
     is_question = any(token in lower for token in question_tokens)
     wants_test = any(token in lower for token in test_tokens)
@@ -357,8 +384,12 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
     wants_diagnose = any(token in lower for token in diagnose_tokens)
 
     wants_file_info = bool(file_id) and any(token in lower for token in file_info_tokens)
+    wants_code_context = bool(file_id) and any(token in lower for token in code_context_tokens)
 
-    if wants_file_info and not (wants_generate or wants_run):
+    if wants_code_context and not (wants_generate or wants_run):
+        intent = "read_code_context"
+        mode = "read"
+    elif wants_file_info and not (wants_generate or wants_run):
         intent = "describe_current_file"
         mode = "read"
     elif any(token in lower for token in explain_tokens) and wants_test:
@@ -403,6 +434,7 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
         "repair_latest": "Repair the latest generated test artifact for the active Java file.",
         "diagnose_latest": "Run a compile/diagnosis action for the latest generated test artifact.",
         "generate_tests": "Generate one JUnit 4 test artifact for the active Java file.",
+        "read_code_context": "Read extracted A3 code context for the active Java file, including FQN, method signatures, Jimple, method source, field context, helper signatures, and throws/modifiers when available.",
         "describe_current_file": "Read the active Java file analysis and answer structural questions such as FQN, package, imports, and methods.",
         "explain_latest_test": "Explain what the latest generated JUnit test is testing. This is read-only.",
         "list_artifacts": "List generated artifacts for the active Java file. This is read-only.",
@@ -578,29 +610,35 @@ class AgentService:
             "analysis": file.analysis,
         }
 
+    def tool_read_code_context(self, args: dict[str, Any]) -> dict[str, Any]:
+        file = self._owned_file(args["file_id"])
+        return build_code_context(
+            file,
+            db=self.db,
+            field=args.get("field"),
+            method_filter=args.get("method_filter"),
+            max_methods=int(args.get("max_methods", 12) or 12),
+            max_field_chars=int(args.get("max_field_chars", 6000) or 6000),
+        )
+
     def tool_generate_tests(self, args: dict[str, Any], cancel_check: Callable[[], bool] | None = None) -> dict[str, Any]:
         file = self._owned_file(args["file_id"])
         source = Path(file.storage_path).read_text(encoding="utf-8", errors="replace")
         goal = args.get("goal") or "Generate JUnit 4 tests with edge cases and exception paths."
         model_used = ""
         prompt = ""
+        rendered_prompt: dict[str, Any] = {}
+        code_context = build_code_context(file, db=self.db, max_methods=8, max_field_chars=5000)
 
         if settings.openai_api_key:
-            prompt = (
-                "Return only one compilable JUnit 4 test class. No markdown fences.\n"
-                "If the source analysis contains a package, the test class must declare exactly the same package.\n"
-                "Prefer tests that compile with JUnit 4 only. Avoid Mockito unless the user explicitly asks for it.\n"
-                "When the source is abstract or protected, create a small concrete test subclass inside the test file.\n"
-                f"Goal: {goal}\n\n"
-                f"Analysis:\n{json.dumps(file.analysis, ensure_ascii=False)}\n\n"
-                f"Source:\n{source[:18000]}"
-            )
+            rendered_prompt = render_generation_prompt(goal, file.analysis or {}, source, code_context)
+            prompt = rendered_prompt["user"]
             try:
                 if cancel_check and cancel_check():
                     raise GenerationCancelled("generation cancelled")
                 client = self.llm_client()
                 messages = [
-                    {"role": "system", "content": "You generate Java JUnit 4 tests for uploaded source files."},
+                    {"role": "system", "content": rendered_prompt["system"]},
                     {"role": "user", "content": prompt},
                 ]
                 if cancel_check:
@@ -661,6 +699,10 @@ class AgentService:
                 "goal": goal,
                 "sha256": hashlib.sha256(code.encode("utf-8")).hexdigest(),
                 "object_key": stored_object,
+                "prompt_template": rendered_prompt.get("template"),
+                "prompt_hash": rendered_prompt.get("hash"),
+                "context_source": code_context.get("context_source"),
+                "context_available_fields": code_context.get("available_fields", []),
             },
         )
         self.db.add(artifact)
@@ -1042,23 +1084,25 @@ class AgentService:
         diagnosis = static_artifact_diagnosis(file.analysis, current_code, compile_log)
         model_used = ""
         prompt = ""
+        rendered_prompt: dict[str, Any] = {}
+        code_context = build_code_context(file, db=self.db, max_methods=8, max_field_chars=5000)
 
         if settings.openai_api_key:
-            prompt = (
-                "Return only one complete Java JUnit 4 test class. No markdown fences.\n"
-                "Repair compile/signature/package/import issues while keeping useful behavioral assertions when possible.\n\n"
-                f"Instruction: {instruction}\n\n"
-                f"Source analysis:\n{json.dumps(file.analysis, ensure_ascii=False)}\n\n"
-                f"Diagnosis:\n{json.dumps(diagnosis, ensure_ascii=False)}\n\n"
-                f"Compile log:\n{compile_log[:8000] or '<none>'}\n\n"
-                f"Uploaded source:\n{source[:14000]}\n\n"
-                f"Current generated test:\n{current_code[:14000]}"
+            rendered_prompt = render_repair_prompt(
+                instruction,
+                file.analysis or {},
+                diagnosis,
+                compile_log,
+                source,
+                current_code,
+                code_context,
             )
+            prompt = rendered_prompt["user"]
             try:
                 response = self.llm_client().chat.completions.create(
                     model=settings.openai_model,
                     messages=[
-                        {"role": "system", "content": "You repair Java JUnit 4 tests for uploaded source files."},
+                        {"role": "system", "content": rendered_prompt["system"]},
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.15,
@@ -1094,6 +1138,10 @@ class AgentService:
                 "diagnosis": diagnosis,
                 "sha256": hashlib.sha256(repaired_code.encode("utf-8")).hexdigest(),
                 "object_key": stored_object,
+                "prompt_template": rendered_prompt.get("template"),
+                "prompt_hash": rendered_prompt.get("hash"),
+                "context_source": code_context.get("context_source"),
+                "context_available_fields": code_context.get("available_fields", []),
             },
         )
         self.db.add(repaired)
@@ -1135,6 +1183,7 @@ class AgentService:
             "prepare_feedback_round": self.tool_prepare_feedback_round,
             "list_files": self.tool_list_files,
             "analyze_file": self.tool_analyze_file,
+            "read_code_context": self.tool_read_code_context,
             "generate_tests": self.tool_generate_tests,
             "batch_generate_tests": self.tool_batch_generate_tests,
             "list_artifacts": self.tool_list_artifacts,
@@ -1205,6 +1254,37 @@ class AgentService:
                     "parameters": {
                         "type": "object",
                         "properties": {"file_id": {"type": "string"}},
+                        "required": ["file_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_code_context",
+                    "description": "Read extracted A3 code context for an uploaded Java file: FQN, method signatures, Jimple, method source, field context, helper signatures, and throws/modifiers. This is read-only.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_id": {"type": "string"},
+                            "field": {
+                                "type": "string",
+                                "enum": [
+                                    "all",
+                                    "fqn",
+                                    "signature",
+                                    "jimple",
+                                    "method_source",
+                                    "field_context",
+                                    "helper_signatures",
+                                    "throws_modifiers",
+                                ],
+                            },
+                            "method_filter": {"type": "string"},
+                            "max_methods": {"type": "integer"},
+                            "max_field_chars": {"type": "integer"},
+                        },
                         "required": ["file_id"],
                         "additionalProperties": False,
                     },
@@ -1366,7 +1446,7 @@ class AgentService:
         seen_calls: set[str],
         call_counts: dict[str, int],
     ) -> dict[str, Any]:
-        if name in {"analyze_file", "generate_tests", "list_artifacts"} and "file_id" not in args and file_id:
+        if name in {"analyze_file", "read_code_context", "generate_tests", "list_artifacts"} and "file_id" not in args and file_id:
             args["file_id"] = file_id
         if name in {"read_artifact", "explain_artifact", "compile_artifact", "diagnose_artifact", "repair_artifact", "run_coverage"} and "artifact_id" not in args and file_id:
             latest = self.latest_artifact_for_file(file_id)
@@ -1379,6 +1459,7 @@ class AgentService:
             "prepare_feedback_round": 1,
             "list_files": 1,
             "analyze_file": 1,
+            "read_code_context": 1,
             "generate_tests": 1,
             "batch_generate_tests": 1,
             "list_artifacts": 1,
@@ -1442,6 +1523,11 @@ class AgentService:
                 "为了避免普通对话里出现不可中断的长时间批处理，批量生成现在需要走右侧 Java 文件面板里的"
                 "“生成未测”或项目组里的“生成项目未测”按钮。那里会显示真实进度，并支持强制中断。"
             )
+        elif file_id and normalized["intent"] == "read_code_context":
+            field = infer_context_field(message)
+            result = self.tool_read_code_context({"file_id": file_id, "field": field})
+            results.append(result)
+            reply = format_code_context_answer(message, result)
         elif file_id and normalized["intent"] == "describe_current_file":
             result = self.tool_analyze_file({"file_id": file_id})
             results.append(result)
@@ -1627,6 +1713,48 @@ class AgentService:
 
         return "工具调用达到本轮上限。我已停止继续调用，请根据已返回的工具结果判断下一步。", results
 
+    def latest_coverage_events(self, conversation_id: str, file_id: str | None) -> Iterator[dict[str, Any]]:
+        if not file_id:
+            reply = "请先在右侧选择一个 Java 文件，再运行覆盖率。"
+            for index in range(0, len(reply), 18):
+                yield {"event": "delta", "text": reply[index : index + 18]}
+            return
+        yield {"event": "status", "message": "5%：正在查找当前文件的最新测试产物...", "stage": "lookup", "percent": 5}
+        file = self._owned_file(file_id)
+        latest = self.latest_artifact_for_file(file_id)
+        if latest is None:
+            result = self.tool_list_artifacts({"file_id": file_id})
+            yield {"event": "tool", "data": result}
+            reply = "当前文件还没有生成过测试产物。请先生成测试，再运行覆盖率。"
+            for index in range(0, len(reply), 18):
+                yield {"event": "delta", "text": reply[index : index + 18]}
+            return
+
+        project_root = self.project_root_for_file(file)
+        if project_root and (project_root / "pom.xml").exists():
+            result = yield from self.run_maven_coverage_events(latest, file, project_root)
+        else:
+            yield {
+                "event": "status",
+                "message": "20%：当前文件不属于 Maven 项目，正在走单文件 javac/JUnit/JaCoCo 路径...",
+                "stage": "local_coverage",
+                "percent": 20,
+            }
+            result = self.tool_run_coverage({"artifact_id": latest.id})
+
+        compact = compact_tool_result(result)
+        self.record_tool(conversation_id, "run_coverage", {"artifact_id": latest.id}, compact)
+        yield {"event": "tool", "data": compact}
+        if compact.get("ok"):
+            target = (compact.get("coverage") or {}).get("target") or {}
+            line = ((target.get("line") or {}).get("percent"))
+            line_text = f"{line}%" if line is not None else "未识别"
+            reply = f"已完成 JaCoCo 覆盖率。目标类行覆盖率：{line_text}。"
+        else:
+            reply = "覆盖率没有跑成：" + concise_failure_reason(compact)
+        for index in range(0, len(reply), 18):
+            yield {"event": "delta", "text": reply[index : index + 18]}
+
     def llm_chat_events(
         self,
         conversation_id: str,
@@ -1634,6 +1762,10 @@ class AgentService:
         file_id: str | None,
         history: list[dict[str, str]],
     ) -> Iterator[dict[str, Any]]:
+        normalized = normalize_user_request(message, file_id)
+        if normalized["intent"] == "run_coverage":
+            yield from self.latest_coverage_events(conversation_id, file_id)
+            return
         if not settings.openai_api_key:
             reply, tool_results = self.scripted_chat(message, file_id)
             for result in tool_results:
@@ -1642,7 +1774,6 @@ class AgentService:
                 yield {"event": "delta", "text": reply[index : index + 18]}
             return
 
-        normalized = normalize_user_request(message, file_id)
         if normalized["mode"] in {"act", "read"} or normalized["intent"] != "chat":
             yield {"event": "status", "message": f"正在执行：{normalized['canonical']}"}
             reply, tool_results = self.scripted_chat(message, file_id)
@@ -1845,6 +1976,57 @@ class AgentService:
         )
         return destination
 
+    def run_process_with_progress(
+        self,
+        command: list[str],
+        cwd: Path | None,
+        timeout_seconds: int,
+        stage: str,
+        label: str,
+        percent: int,
+    ) -> Iterator[dict[str, Any]]:
+        yield {
+            "event": "status",
+            "message": f"{percent}%：{label}，预计最长 {timeout_seconds} 秒。",
+            "stage": stage,
+            "percent": percent,
+        }
+        started = time.monotonic()
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+                elapsed = int(time.monotonic() - started)
+                return {
+                    "return_code": process.returncode,
+                    "output": (stdout or "") + (stderr or ""),
+                    "elapsed_seconds": elapsed,
+                    "timed_out": False,
+                }
+            except subprocess.TimeoutExpired:
+                elapsed = int(time.monotonic() - started)
+                if elapsed >= timeout_seconds:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    return {
+                        "return_code": None,
+                        "output": (stdout or "") + (stderr or ""),
+                        "elapsed_seconds": elapsed,
+                        "timed_out": True,
+                    }
+                yield {
+                    "event": "status",
+                    "message": f"{percent}%：{label}已运行 {elapsed} 秒，仍在正常执行...",
+                    "stage": stage,
+                    "percent": percent,
+                }
+
     def force_maven_java8(self, work_project: Path) -> None:
         pom = work_project / "pom.xml"
         if not pom.exists():
@@ -1903,6 +2085,124 @@ class AgentService:
                 "test_class": test_class,
                 "source_scope": "maven_project",
                 "project_root": str(project_root),
+            }
+
+    def run_maven_coverage_events(self, artifact: GeneratedArtifact, file: UploadedFile, project_root: Path) -> Iterator[dict[str, Any]]:
+        mvn = shutil.which("mvn")
+        if not mvn:
+            return {"ok": False, "tool": "run_coverage", "available": False, "reason": "mvn was not found in PATH."}
+        run_root = settings.storage_dir / "project_runs"
+        run_root.mkdir(parents=True, exist_ok=True)
+        yield {"event": "status", "message": "10%：准备 Maven 项目运行副本...", "stage": "prepare", "percent": 10}
+        with tempfile.TemporaryDirectory(prefix="maven_coverage_", dir=run_root) as tmp_dir:
+            tmp = Path(tmp_dir)
+            work_project = self.copy_project_for_run(project_root, tmp)
+            yield {"event": "status", "message": "18%：修正旧项目 Java 编译版本并写入生成测试...", "stage": "prepare", "percent": 18}
+            self.force_maven_java8(work_project)
+            code, test_rel_path, test_class = self.project_test_code_and_path(file, artifact)
+            target = work_project / test_rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(code, encoding="utf-8")
+            base_command = [
+                mvn,
+                "-q",
+                "-Dmaven.compiler.source=1.8",
+                "-Dmaven.compiler.target=1.8",
+            ]
+
+            compile_result = yield from self.run_process_with_progress(
+                [*base_command, "-DskipTests", "test-compile"],
+                work_project,
+                max(settings.compile_timeout_seconds, 120),
+                "maven_compile",
+                "Maven 正在编译项目和测试依赖",
+                35,
+            )
+            if compile_result.get("timed_out") or compile_result.get("return_code") != 0:
+                output = str(compile_result.get("output") or "")
+                return {
+                    "ok": False,
+                    "tool": "run_coverage",
+                    "available": True,
+                    "stage": "maven_compile",
+                    "return_code": compile_result.get("return_code"),
+                    "output": truncate(output, 12000),
+                    "diagnosis": "Maven 编译超时。" if compile_result.get("timed_out") else concise_failure_reason({"stage": "maven_compile", "output": output}),
+                    "artifact": artifact_summary(artifact),
+                    "test_class": test_class,
+                    "source_scope": "maven_project",
+                    "project_root": str(project_root),
+                    "elapsed_seconds": compile_result.get("elapsed_seconds"),
+                }
+
+            test_result = yield from self.run_process_with_progress(
+                [*base_command, "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent", "test"],
+                work_project,
+                max(settings.test_timeout_seconds, 180),
+                "maven_test",
+                "Maven 正在运行 JUnit 并采集 JaCoCo exec 数据",
+                70,
+            )
+            if test_result.get("timed_out") or test_result.get("return_code") != 0:
+                output = str(test_result.get("output") or "")
+                return {
+                    "ok": False,
+                    "tool": "run_coverage",
+                    "available": True,
+                    "stage": "maven_test",
+                    "return_code": test_result.get("return_code"),
+                    "output": truncate(output, 12000),
+                    "diagnosis": "Maven 测试超时。" if test_result.get("timed_out") else concise_failure_reason({"stage": "maven_test", "output": output}),
+                    "artifact": artifact_summary(artifact),
+                    "test_class": test_class,
+                    "source_scope": "maven_project",
+                    "project_root": str(project_root),
+                    "elapsed_seconds": test_result.get("elapsed_seconds"),
+                }
+
+            report_result = yield from self.run_process_with_progress(
+                [*base_command, "org.jacoco:jacoco-maven-plugin:0.8.12:report"],
+                work_project,
+                max(settings.test_timeout_seconds, 120),
+                "jacoco_report",
+                "JaCoCo 正在生成覆盖率报告",
+                90,
+            )
+            if report_result.get("timed_out") or report_result.get("return_code") != 0:
+                output = str(report_result.get("output") or "")
+                return {
+                    "ok": False,
+                    "tool": "run_coverage",
+                    "available": True,
+                    "stage": "jacoco_report",
+                    "return_code": report_result.get("return_code"),
+                    "output": truncate(output, 12000),
+                    "diagnosis": "JaCoCo 报告生成超时。" if report_result.get("timed_out") else concise_failure_reason({"stage": "jacoco_report", "output": output}),
+                    "artifact": artifact_summary(artifact),
+                    "test_class": test_class,
+                    "source_scope": "maven_project",
+                    "project_root": str(project_root),
+                    "elapsed_seconds": report_result.get("elapsed_seconds"),
+                }
+
+            yield {"event": "status", "message": "96%：正在解析 JaCoCo CSV 覆盖率...", "stage": "parse_report", "percent": 96}
+            csv_report = work_project / "target" / "site" / "jacoco" / "jacoco.csv"
+            coverage = self.parse_jacoco_csv(csv_report, (file.analysis or {}).get("class_name"))
+            return {
+                "ok": bool(coverage.get("ok")),
+                "tool": "run_coverage",
+                "artifact": artifact_summary(artifact),
+                "test_class": test_class,
+                "source_file": {"id": file.id, "name": file.original_name, "class_name": file.analysis.get("class_name")},
+                "source_scope": "maven_project",
+                "project_root": str(project_root),
+                "junit_output": truncate(str(test_result.get("output") or ""), 3000),
+                "coverage": coverage,
+                "elapsed_seconds": {
+                    "compile": compile_result.get("elapsed_seconds"),
+                    "test": test_result.get("elapsed_seconds"),
+                    "report": report_result.get("elapsed_seconds"),
+                },
             }
 
     def run_maven_coverage(self, artifact: GeneratedArtifact, file: UploadedFile, project_root: Path) -> dict[str, Any]:

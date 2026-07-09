@@ -53,6 +53,24 @@ export type Artifact = {
   created_at: string;
 };
 
+export type AgentJob = {
+  id: string;
+  kind: string;
+  status: string;
+  progress: number;
+  stage: string;
+  message: string;
+  external_id?: string;
+  request_json?: Record<string, unknown>;
+  result_json?: Record<string, unknown>;
+  error?: string;
+  cancel_requested?: boolean;
+  created_at: string;
+  updated_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+};
+
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000/api";
 
 function token() {
@@ -189,6 +207,12 @@ export type BatchStreamHandlers = {
   onError?: (payload: Record<string, unknown>) => void;
 };
 
+export type JobStreamHandlers = {
+  onProgress?: (payload: AgentJob) => void;
+  onDone?: (payload: AgentJob) => void;
+  onError?: (payload: Record<string, unknown>) => void;
+};
+
 export function uploadJava(file: File) {
   const form = new FormData();
   form.append("file", file);
@@ -285,6 +309,50 @@ export function cancelBatchGenerate(jobId: string) {
   return request<{ ok: boolean; job_id: string; cancelled: boolean }>(`/files/generate/batch/${encodeURIComponent(jobId)}/cancel`, {
     method: "POST"
   });
+}
+
+export function extractCodeContext(fileIds?: string[], projectId?: string) {
+  return request<AgentJob>("/files/context/extract", {
+    method: "POST",
+    body: JSON.stringify({
+      file_ids: fileIds && fileIds.length ? fileIds : undefined,
+      project_id: projectId
+    })
+  });
+}
+
+export async function streamJob(jobId: string, handlers: JobStreamHandlers, signal?: AbortSignal) {
+  const response = await fetch(`${API_BASE}/files/jobs/${encodeURIComponent(jobId)}/stream`, {
+    method: "GET",
+    signal,
+    headers: { Authorization: `Bearer ${token()}` }
+  });
+  if (!response.ok || !response.body) throw new Error(await response.text());
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop() || "";
+    for (const raw of events) {
+      const event = raw.match(/^event:\s*(.+)$/m)?.[1] || "message";
+      const dataLine = raw.match(/^data:\s*(.+)$/m)?.[1] || "{}";
+      const payload = JSON.parse(dataLine) as AgentJob;
+      if (event === "progress") handlers.onProgress?.(payload);
+      if (event === "done") handlers.onDone?.(payload);
+      if (event === "error") handlers.onError?.(payload as unknown as Record<string, unknown>);
+    }
+  }
+}
+
+export function cancelJob(jobId: string) {
+  return request<{ ok: boolean; job_id: string; cancel_requested: boolean; status: string }>(
+    `/files/jobs/${encodeURIComponent(jobId)}/cancel`,
+    { method: "POST" }
+  );
 }
 
 export function getArtifacts(fileId: string) {

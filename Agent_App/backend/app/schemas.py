@@ -115,6 +115,32 @@ class BatchGenerateIn(BaseModel):
     job_id: str | None = None
 
 
+class ContextExtractIn(BaseModel):
+    file_ids: list[str] | None = None
+    project_id: str | None = None
+
+
+class AgentJobOut(BaseModel):
+    id: str
+    kind: str
+    status: str
+    progress: int
+    stage: str
+    message: str
+    external_id: str = ""
+    request_json: dict[str, Any] = {}
+    result_json: dict[str, Any] = {}
+    error: str = ""
+    cancel_requested: bool = False
+    created_at: dt.datetime
+    updated_at: dt.datetime
+    started_at: dt.datetime | None = None
+    finished_at: dt.datetime | None = None
+
+    class Config:
+        from_attributes = True
+
+
 class ArtifactOut(BaseModel):
     id: str
     file_id: str

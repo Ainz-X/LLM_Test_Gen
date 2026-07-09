@@ -70,6 +70,60 @@ class UploadedFile(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
 
+class AgentJob(Base):
+    __tablename__ = "agent_jobs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(80), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    stage: Mapped[str] = mapped_column(String(120), default="")
+    message: Mapped[str] = mapped_column(Text, default="")
+    external_id: Mapped[str] = mapped_column(String(255), default="")
+    request_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    result_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str] = mapped_column(Text, default="")
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    started_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class CodeContext(Base):
+    __tablename__ = "code_contexts"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "file_sha256",
+            "extractor_version",
+            "method_fqn_hash",
+            name="uq_context_file_method_version",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    file_id: Mapped[str | None] = mapped_column(ForeignKey("uploaded_files.id"), nullable=True, index=True)
+    project_id: Mapped[str] = mapped_column(String(80), default="", index=True)
+    file_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    extractor_version: Mapped[str] = mapped_column(String(80), default="method-context-extractor-0.2.0")
+    method_fqn_hash: Mapped[str] = mapped_column(String(64), index=True)
+    method_fqn: Mapped[str] = mapped_column(Text)
+    signature: Mapped[str] = mapped_column(Text, default="")
+    jimple: Mapped[str] = mapped_column(Text, default="")
+    method_source: Mapped[str] = mapped_column(Text, default="")
+    field_context: Mapped[str] = mapped_column(Text, default="")
+    helper_signatures: Mapped[str] = mapped_column(Text, default="")
+    throws_modifiers: Mapped[str] = mapped_column(Text, default="")
+    source_path: Mapped[str] = mapped_column(Text, default="")
+    context_source: Mapped[str] = mapped_column(String(120), default="")
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
 class GeneratedArtifact(Base):
     __tablename__ = "generated_artifacts"
 
