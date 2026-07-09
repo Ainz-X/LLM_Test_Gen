@@ -2123,6 +2123,21 @@ class AgentService:
         if updated != text:
             pom.write_text(updated, encoding="utf-8")
 
+    def isolate_existing_maven_tests(self, work_project: Path) -> list[str]:
+        ignored: list[str] = []
+        for candidate in [
+            work_project / "src" / "test" / "java",
+            work_project / "test_suite",
+            work_project / "tests",
+            work_project / "evosuite-tests",
+        ]:
+            if not candidate.exists():
+                continue
+            destination = candidate.parent / f".a3_ignored_{candidate.name}"
+            shutil.move(str(candidate), str(destination))
+            ignored.append(str(candidate.relative_to(work_project)).replace("\\", "/"))
+        return ignored
+
     def compile_maven_artifact(self, artifact: GeneratedArtifact, file: UploadedFile, project_root: Path) -> dict[str, Any]:
         mvn = shutil.which("mvn")
         if not mvn:
@@ -2133,6 +2148,7 @@ class AgentService:
             tmp = Path(tmp_dir)
             work_project = self.copy_project_for_run(project_root, tmp)
             self.force_maven_java8(work_project)
+            ignored_test_sources = self.isolate_existing_maven_tests(work_project)
             code, test_rel_path, test_class = self.project_test_code_and_path(file, artifact)
             target = work_project / test_rel_path
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -2161,6 +2177,7 @@ class AgentService:
                     "source_scope": "maven_project",
                     "project_root": str(project_root),
                     "elapsed_seconds": settings.maven_compile_timeout_seconds,
+                    "ignored_existing_test_sources": ignored_test_sources,
                 }
             output = (completed.stdout or "") + (completed.stderr or "")
             return {
@@ -2174,6 +2191,7 @@ class AgentService:
                 "test_class": test_class,
                 "source_scope": "maven_project",
                 "project_root": str(project_root),
+                "ignored_existing_test_sources": ignored_test_sources,
             }
 
     def run_maven_coverage_events(self, artifact: GeneratedArtifact, file: UploadedFile, project_root: Path) -> Iterator[dict[str, Any]]:
@@ -2186,8 +2204,9 @@ class AgentService:
         with tempfile.TemporaryDirectory(prefix="maven_coverage_", dir=run_root) as tmp_dir:
             tmp = Path(tmp_dir)
             work_project = self.copy_project_for_run(project_root, tmp)
-            yield {"event": "status", "message": "18%：修正旧项目 Java 编译版本并写入生成测试...", "stage": "prepare", "percent": 18}
+            yield {"event": "status", "message": "18%：修正旧项目 Java 编译版本，隔离已有测试源码...", "stage": "prepare", "percent": 18}
             self.force_maven_java8(work_project)
+            ignored_test_sources = self.isolate_existing_maven_tests(work_project)
             code, test_rel_path, test_class = self.project_test_code_and_path(file, artifact)
             target = work_project / test_rel_path
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -2222,10 +2241,11 @@ class AgentService:
                     "source_scope": "maven_project",
                     "project_root": str(project_root),
                     "elapsed_seconds": compile_result.get("elapsed_seconds"),
+                    "ignored_existing_test_sources": ignored_test_sources,
                 }
 
             test_result = yield from self.run_process_with_progress(
-                [*base_command, "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent", "test"],
+                [*base_command, f"-Dtest={test_class.split('.')[-1]}", "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent", "test"],
                 work_project,
                 settings.maven_test_timeout_seconds,
                 "maven_test",
@@ -2247,6 +2267,7 @@ class AgentService:
                     "source_scope": "maven_project",
                     "project_root": str(project_root),
                     "elapsed_seconds": test_result.get("elapsed_seconds"),
+                    "ignored_existing_test_sources": ignored_test_sources,
                 }
 
             report_result = yield from self.run_process_with_progress(
@@ -2272,6 +2293,7 @@ class AgentService:
                     "source_scope": "maven_project",
                     "project_root": str(project_root),
                     "elapsed_seconds": report_result.get("elapsed_seconds"),
+                    "ignored_existing_test_sources": ignored_test_sources,
                 }
 
             yield {"event": "status", "message": "96%：正在解析 JaCoCo CSV 覆盖率...", "stage": "parse_report", "percent": 96}
@@ -2287,6 +2309,7 @@ class AgentService:
                 "project_root": str(project_root),
                 "junit_output": truncate(str(test_result.get("output") or ""), 3000),
                 "coverage": coverage,
+                "ignored_existing_test_sources": ignored_test_sources,
                 "elapsed_seconds": {
                     "compile": compile_result.get("elapsed_seconds"),
                     "test": test_result.get("elapsed_seconds"),
@@ -2304,6 +2327,7 @@ class AgentService:
             tmp = Path(tmp_dir)
             work_project = self.copy_project_for_run(project_root, tmp)
             self.force_maven_java8(work_project)
+            ignored_test_sources = self.isolate_existing_maven_tests(work_project)
             code, test_rel_path, test_class = self.project_test_code_and_path(file, artifact)
             target = work_project / test_rel_path
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -2313,6 +2337,7 @@ class AgentService:
                 "-B",
                 "-Dmaven.compiler.source=1.8",
                 "-Dmaven.compiler.target=1.8",
+                f"-Dtest={test_class.split('.')[-1]}",
                 "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent",
                 "test",
                 "org.jacoco:jacoco-maven-plugin:0.8.12:report",
@@ -2340,6 +2365,7 @@ class AgentService:
                     "test_class": test_class,
                     "source_scope": "maven_project",
                     "project_root": str(project_root),
+                    "ignored_existing_test_sources": ignored_test_sources,
                 }
             output = (completed.stdout or "") + (completed.stderr or "")
             if completed.returncode != 0:
@@ -2355,6 +2381,7 @@ class AgentService:
                     "test_class": test_class,
                     "source_scope": "maven_project",
                     "project_root": str(project_root),
+                    "ignored_existing_test_sources": ignored_test_sources,
                 }
             csv_report = work_project / "target" / "site" / "jacoco" / "jacoco.csv"
             coverage = self.parse_jacoco_csv(csv_report, (file.analysis or {}).get("class_name"))
@@ -2368,6 +2395,7 @@ class AgentService:
                 "project_root": str(project_root),
                 "junit_output": truncate(output, 3000),
                 "coverage": coverage,
+                "ignored_existing_test_sources": ignored_test_sources,
             }
 
     def test_class_name(self, code: str) -> str:
