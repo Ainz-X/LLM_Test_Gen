@@ -26,6 +26,9 @@ from app.services.source_selection import file_source_name, is_uploaded_test_sou
 from app.services.storage_service import put_object
 
 
+JACOCO_VERSION = "0.8.12"
+
+
 class GenerationCancelled(Exception):
     pass
 
@@ -311,6 +314,10 @@ def concise_failure_reason(result: dict[str, Any]) -> str:
         return "编译失败：缺少项目依赖包或上传的源码不完整。"
     if "NoClassDefFoundError" in output or "ClassNotFoundException" in output:
         return "运行失败：JUnit 运行时找不到测试类或被测类。"
+    if "could not be instrumented" in output and "org.jacoco.agent.rt.internal_" in output:
+        return "JaCoCo agent 与当前 JDK 不兼容：项目继承的旧 JaCoCo 插件会导致测试 JVM 崩溃，请使用 0.8.12+ agent 重新采集覆盖率。"
+    if "The forked VM terminated without properly saying goodbye" in output and "javaagent" in output:
+        return "Maven Surefire 的测试 JVM 被 javaagent 异常终止，通常是旧 JaCoCo agent 或重复注入 JaCoCo agent 导致。"
     stage = result.get("stage")
     if stage:
         return f"在 `{stage}` 阶段失败，请查看工具输出中的编译/运行日志。"
@@ -2233,6 +2240,42 @@ class AgentService:
         if updated != text:
             pom.write_text(updated, encoding="utf-8")
 
+    def ensure_jacoco_runtime_agent(self, mvn: str, work_project: Path) -> tuple[Path | None, str]:
+        agent_path = (
+            Path.home()
+            / ".m2"
+            / "repository"
+            / "org"
+            / "jacoco"
+            / "org.jacoco.agent"
+            / JACOCO_VERSION
+            / f"org.jacoco.agent-{JACOCO_VERSION}-runtime.jar"
+        )
+        if agent_path.exists():
+            return agent_path, ""
+        try:
+            completed = subprocess.run(
+                [
+                    mvn,
+                    "-B",
+                    "dependency:get",
+                    f"-Dartifact=org.jacoco:org.jacoco.agent:{JACOCO_VERSION}:jar:runtime",
+                ],
+                cwd=work_project,
+                capture_output=True,
+                text=True,
+                timeout=settings.maven_report_timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return None, process_output(exc.stdout, exc.stderr)
+        output = (completed.stdout or "") + (completed.stderr or "")
+        return (agent_path if agent_path.exists() else None), output
+
+    def jacoco_arg_line(self, agent_path: Path, work_project: Path) -> str:
+        exec_path = work_project / "target" / "jacoco.exec"
+        return f"-javaagent:{agent_path.as_posix()}=destfile={exec_path.as_posix()}"
+
     def isolate_existing_maven_tests(self, work_project: Path) -> list[str]:
         ignored: list[str] = []
         for candidate in [
@@ -2354,8 +2397,37 @@ class AgentService:
                     "ignored_existing_test_sources": ignored_test_sources,
                 }
 
+            yield {
+                "event": "status",
+                "message": f"55%：准备 JaCoCo {JACOCO_VERSION} runtime agent，跳过项目继承的旧 JaCoCo agent...",
+                "stage": "jacoco_agent",
+                "percent": 55,
+            }
+            jacoco_agent, jacoco_agent_output = self.ensure_jacoco_runtime_agent(mvn, work_project)
+            if not jacoco_agent:
+                return {
+                    "ok": False,
+                    "tool": "run_coverage",
+                    "available": True,
+                    "stage": "jacoco_agent",
+                    "return_code": None,
+                    "output": truncate(jacoco_agent_output, 12000),
+                    "diagnosis": f"无法准备 JaCoCo {JACOCO_VERSION} runtime agent，Maven 本地仓库中没有对应 jar，且自动下载失败。",
+                    "artifact": artifact_summary(artifact),
+                    "test_class": test_class,
+                    "source_scope": "maven_project",
+                    "project_root": str(project_root),
+                    "ignored_existing_test_sources": ignored_test_sources,
+                }
+
             test_result = yield from self.run_process_with_progress(
-                [*base_command, f"-Dtest={test_class.split('.')[-1]}", "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent", "test"],
+                [
+                    *base_command,
+                    "-Djacoco.skip=true",
+                    f"-DargLine={self.jacoco_arg_line(jacoco_agent, work_project)}",
+                    f"-Dtest={test_class.split('.')[-1]}",
+                    "test",
+                ],
                 work_project,
                 settings.maven_test_timeout_seconds,
                 "maven_test",
@@ -2381,7 +2453,7 @@ class AgentService:
                 }
 
             report_result = yield from self.run_process_with_progress(
-                [*base_command, "org.jacoco:jacoco-maven-plugin:0.8.12:report"],
+                [*base_command, f"org.jacoco:jacoco-maven-plugin:{JACOCO_VERSION}:report"],
                 work_project,
                 settings.maven_report_timeout_seconds,
                 "jacoco_report",
@@ -2442,15 +2514,31 @@ class AgentService:
             target = work_project / test_rel_path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(code, encoding="utf-8")
+            jacoco_agent, jacoco_agent_output = self.ensure_jacoco_runtime_agent(mvn, work_project)
+            if not jacoco_agent:
+                return {
+                    "ok": False,
+                    "tool": "run_coverage",
+                    "available": True,
+                    "stage": "jacoco_agent",
+                    "return_code": None,
+                    "output": truncate(jacoco_agent_output, 12000),
+                    "diagnosis": f"无法准备 JaCoCo {JACOCO_VERSION} runtime agent，Maven 本地仓库中没有对应 jar，且自动下载失败。",
+                    "artifact": artifact_summary(artifact),
+                    "test_class": test_class,
+                    "source_scope": "maven_project",
+                    "project_root": str(project_root),
+                    "ignored_existing_test_sources": ignored_test_sources,
+                }
             command = [
                 mvn,
                 "-B",
                 "-Dmaven.compiler.source=1.8",
                 "-Dmaven.compiler.target=1.8",
+                "-Djacoco.skip=true",
+                f"-DargLine={self.jacoco_arg_line(jacoco_agent, work_project)}",
                 f"-Dtest={test_class.split('.')[-1]}",
-                "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent",
                 "test",
-                "org.jacoco:jacoco-maven-plugin:0.8.12:report",
             ]
             try:
                 completed = subprocess.run(
@@ -2458,7 +2546,7 @@ class AgentService:
                     cwd=work_project,
                     capture_output=True,
                     text=True,
-                    timeout=settings.maven_test_timeout_seconds + settings.maven_report_timeout_seconds,
+                    timeout=settings.maven_test_timeout_seconds,
                     check=False,
                 )
             except subprocess.TimeoutExpired as exc:
@@ -2467,10 +2555,10 @@ class AgentService:
                     "ok": False,
                     "tool": "run_coverage",
                     "available": True,
-                    "stage": "maven",
+                    "stage": "maven_test",
                     "return_code": None,
                     "output": truncate(output, 12000),
-                    "diagnosis": f"Maven 覆盖率执行超时：超过 {settings.maven_test_timeout_seconds + settings.maven_report_timeout_seconds} 秒。建议使用流式覆盖率入口查看分阶段进度。",
+                    "diagnosis": f"Maven 测试超时：超过 {settings.maven_test_timeout_seconds} 秒。建议使用流式覆盖率入口查看分阶段进度。",
                     "artifact": artifact_summary(artifact),
                     "test_class": test_class,
                     "source_scope": "maven_project",
@@ -2483,16 +2571,65 @@ class AgentService:
                     "ok": False,
                     "tool": "run_coverage",
                     "available": True,
-                    "stage": "maven",
+                    "stage": "maven_test",
                     "return_code": completed.returncode,
                     "output": truncate(output, 12000),
-                    "diagnosis": concise_failure_reason({"stage": "maven", "output": output}),
+                    "diagnosis": concise_failure_reason({"stage": "maven_test", "output": output}),
                     "artifact": artifact_summary(artifact),
                     "test_class": test_class,
                     "source_scope": "maven_project",
                     "project_root": str(project_root),
                     "ignored_existing_test_sources": ignored_test_sources,
                 }
+            report_command = [
+                mvn,
+                "-B",
+                "-Dmaven.compiler.source=1.8",
+                "-Dmaven.compiler.target=1.8",
+                f"org.jacoco:jacoco-maven-plugin:{JACOCO_VERSION}:report",
+            ]
+            try:
+                report_completed = subprocess.run(
+                    report_command,
+                    cwd=work_project,
+                    capture_output=True,
+                    text=True,
+                    timeout=settings.maven_report_timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                report_output = process_output(exc.stdout, exc.stderr)
+                return {
+                    "ok": False,
+                    "tool": "run_coverage",
+                    "available": True,
+                    "stage": "jacoco_report",
+                    "return_code": None,
+                    "output": truncate(report_output, 12000),
+                    "diagnosis": f"JaCoCo 报告生成超时：超过 {settings.maven_report_timeout_seconds} 秒。",
+                    "artifact": artifact_summary(artifact),
+                    "test_class": test_class,
+                    "source_scope": "maven_project",
+                    "project_root": str(project_root),
+                    "ignored_existing_test_sources": ignored_test_sources,
+                }
+            report_output = (report_completed.stdout or "") + (report_completed.stderr or "")
+            if report_completed.returncode != 0:
+                return {
+                    "ok": False,
+                    "tool": "run_coverage",
+                    "available": True,
+                    "stage": "jacoco_report",
+                    "return_code": report_completed.returncode,
+                    "output": truncate(report_output, 12000),
+                    "diagnosis": concise_failure_reason({"stage": "jacoco_report", "output": report_output}),
+                    "artifact": artifact_summary(artifact),
+                    "test_class": test_class,
+                    "source_scope": "maven_project",
+                    "project_root": str(project_root),
+                    "ignored_existing_test_sources": ignored_test_sources,
+                }
+            output += report_output
             csv_report = work_project / "target" / "site" / "jacoco" / "jacoco.csv"
             coverage = self.parse_jacoco_csv(csv_report, (file.analysis or {}).get("class_name"))
             return {
