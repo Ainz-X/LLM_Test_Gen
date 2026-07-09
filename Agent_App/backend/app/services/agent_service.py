@@ -17,7 +17,7 @@ from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models import AgentMemory, GeneratedArtifact, MessageFeedback, ToolCall, UploadedFile, User
+from app.models import AgentJob, AgentMemory, GeneratedArtifact, MessageFeedback, ToolCall, UploadedFile, User
 from app.services import a3_tools
 from app.services.code_context_service import build_code_context, format_code_context_answer, infer_context_field
 from app.services.java_analysis import junit4_scaffold
@@ -633,6 +633,98 @@ class AgentService:
             max_methods=int(args.get("max_methods", 12) or 12),
             max_field_chars=int(args.get("max_field_chars", 6000) or 6000),
         )
+
+    def job_summary(self, job: AgentJob) -> dict[str, Any]:
+        return {
+            "id": job.id,
+            "kind": job.kind,
+            "status": job.status,
+            "progress": job.progress,
+            "stage": job.stage,
+            "message": job.message,
+            "external_id": job.external_id,
+            "request_json": job.request_json or {},
+            "result_json": job.result_json or {},
+            "error": job.error,
+            "cancel_requested": job.cancel_requested,
+            "created_at": job.created_at.isoformat(),
+            "updated_at": job.updated_at.isoformat(),
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        }
+
+    def enqueue_context_extraction_for_file(self, file: UploadedFile, reason: str) -> dict[str, Any] | None:
+        analysis = file.analysis or {}
+        project_id = analysis.get("_project_id")
+        project_root = Path(str(analysis.get("_project_root") or ""))
+        if not project_id or not project_root or not (project_root / "pom.xml").exists():
+            return None
+        if is_uploaded_test_source(file):
+            return None
+
+        recent_jobs = (
+            self.db.query(AgentJob)
+            .filter(
+                AgentJob.user_id == self.user.id,
+                AgentJob.kind == "code_context_extraction",
+                AgentJob.status.in_(["queued", "running"]),
+            )
+            .order_by(AgentJob.created_at.desc())
+            .limit(20)
+            .all()
+        )
+        for job in recent_jobs:
+            if file.id in set((job.request_json or {}).get("file_ids") or []):
+                return {
+                    "ok": True,
+                    "tool": "extract_code_context",
+                    "queued": False,
+                    "reason": "已有同一文件的上下文提取任务正在运行，已复用该任务。",
+                    "job": self.job_summary(job),
+                    "file_ids": [file.id],
+                }
+
+        job = AgentJob(
+            user_id=self.user.id,
+            kind="code_context_extraction",
+            status="queued",
+            progress=0,
+            stage="queued",
+            message="已加入后台队列，正在准备提取 Jimple 上下文。",
+            request_json={
+                "file_ids": [file.id],
+                "project_id": project_id,
+                "project_ids": [project_id],
+                "trigger": "chat_missing_jimple",
+                "reason": reason,
+            },
+        )
+        self.db.add(job)
+        self.db.commit()
+        self.db.refresh(job)
+        try:
+            from app.tasks.context_extraction import extract_code_context_task
+
+            task = extract_code_context_task.delay(job.id)
+            job.external_id = task.id
+            self.db.commit()
+            self.db.refresh(job)
+        except Exception as exc:
+            job.status = "failed"
+            job.progress = 100
+            job.stage = "queue_failed"
+            job.message = "提交后台上下文提取任务失败，请确认 Redis/Celery worker 已启动。"
+            job.error = f"{type(exc).__name__}: {exc}"
+            self.db.commit()
+            self.db.refresh(job)
+        return {
+            "ok": job.status != "failed",
+            "tool": "extract_code_context",
+            "queued": job.status != "failed",
+            "reason": reason,
+            "job": self.job_summary(job),
+            "file_ids": [file.id],
+        }
 
     def tool_generate_tests(self, args: dict[str, Any], cancel_check: Callable[[], bool] | None = None) -> dict[str, Any]:
         file = self._owned_file(args["file_id"])
@@ -1591,7 +1683,25 @@ class AgentService:
             field = infer_context_field(message)
             result = self.tool_read_code_context({"file_id": file_id, "field": field})
             results.append(result)
-            reply = format_code_context_answer(message, result)
+            if field == "jimple" and "jimple" in set(result.get("unavailable_fields") or []):
+                file = self._owned_file(file_id)
+                queued = self.enqueue_context_extraction_for_file(
+                    file,
+                    "用户询问 Jimple，但当前文件还没有 SootUp/Jimple 上下文。",
+                )
+                if queued:
+                    results.append(queued)
+                    job = queued.get("job") or {}
+                    reply = (
+                        "当前文件还没有可用的 Jimple Code。我已经自动启动后台上下文提取任务，"
+                        "会先 Maven compile 生成 .class，再用 SootUp/JavaParser 提取 Jimple。\n\n"
+                        f"任务 ID：`{job.get('id')}`\n"
+                        "进度会在任务弹窗里显示；完成后再问一次“当前代码的 Jimple Code 是什么”即可读取结果。"
+                    )
+                else:
+                    reply = format_code_context_answer(message, result)
+            else:
+                reply = format_code_context_answer(message, result)
         elif file_id and normalized["intent"] == "describe_current_file":
             result = self.tool_analyze_file({"file_id": file_id})
             results.append(result)

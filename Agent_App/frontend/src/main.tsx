@@ -728,6 +728,87 @@ function App() {
     }
   }
 
+  async function trackContextJobFromTool(payload: Record<string, unknown>) {
+    if (payload.tool !== "extract_code_context") return;
+    const job = payload.job as AgentJob | undefined;
+    if (!job?.id) return;
+    const fileIds = Array.isArray(payload.file_ids) ? payload.file_ids.map(String) : activeFileId ? [activeFileId] : [];
+    const controller = new AbortController();
+    contextAbortRef.current = { controller, jobId: job.id };
+    const title = "自动提取 Jimple 上下文";
+    setTaskModal({
+      open: true,
+      running: !["succeeded", "failed", "cancelled"].includes(job.status),
+      kind: "context",
+      title,
+      detail: job.message || "已启动后台上下文提取任务",
+      progress: job.progress || 0,
+      indeterminate: false,
+      cancelled: job.status === "cancelled",
+      jobId: job.id,
+      files: files.filter((file) => fileIds.includes(file.id)),
+      rejected: []
+    });
+    try {
+      await streamJob(
+        job.id,
+        {
+          onProgress: (next) => {
+            setTaskModal((current) => ({
+              ...current,
+              progress: Math.max(0, Math.min(100, Number(next.progress || 0))),
+              detail: next.message || current.detail
+            }));
+          },
+          onDone: (done) => {
+            const result = done.result_json || {};
+            setTaskModal((current) => ({
+              ...current,
+              running: false,
+              cancelled: done.status === "cancelled",
+              progress: 100,
+              detail: done.status === "failed" ? done.error || done.message || "上下文提取失败" : done.message || "上下文提取完成",
+              result: {
+                ok: done.status === "succeeded",
+                context_rows: Number(result.context_rows || 0),
+                file_count: Number(result.file_count || fileIds.length),
+                failed_count: done.status === "failed" ? 1 : 0,
+                generated_count: 0,
+                skipped_count: 0,
+                groups: result.groups as unknown[] | undefined
+              }
+            }));
+            refresh().catch(console.error);
+          },
+          onError: (error) => {
+            setTaskModal((current) => ({
+              ...current,
+              running: false,
+              progress: 100,
+              detail: String(error.detail || "上下文提取失败"),
+              result: { ok: false, failed_count: 1 }
+            }));
+          }
+        },
+        controller.signal
+      );
+    } catch (err) {
+      if (!(err instanceof DOMException && err.name === "AbortError")) {
+        setTaskModal((current) => ({
+          ...current,
+          running: false,
+          progress: 100,
+          detail: err instanceof Error ? err.message : "上下文提取失败",
+          result: { ok: false, failed_count: 1 }
+        }));
+      }
+    } finally {
+      if (contextAbortRef.current?.jobId === job.id) {
+        contextAbortRef.current = null;
+      }
+    }
+  }
+
   async function submitChat(event?: FormEvent, preset?: string) {
     event?.preventDefault();
     const message = (preset ?? input).trim();
@@ -766,6 +847,7 @@ function App() {
                 : item
             )
           );
+          trackContextJobFromTool(payload).catch(console.error);
         },
         onDelta: (chunk) => {
           setMessages((current) =>
