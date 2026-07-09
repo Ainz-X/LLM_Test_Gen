@@ -144,6 +144,8 @@ def chat_stream(payload: ChatRequest, db: Session = Depends(get_db), user: User 
                 result = event["data"]
                 tool_results.append(result)
                 yield sse("tool", result)
+            elif event.get("event") == "status":
+                yield sse("status", {"message": str(event.get("message") or "处理中")})
             elif event.get("event") == "delta":
                 text = str(event.get("text") or "")
                 reply_parts.append(text)

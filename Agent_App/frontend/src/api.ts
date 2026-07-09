@@ -36,6 +36,7 @@ export type BatchGenerateResult = {
   generated_count?: number;
   failed_count?: number;
   skipped_count?: number;
+  cancelled?: boolean;
   generated?: Array<{ file_id?: string; file_name?: string; artifact_id?: string; artifact_file?: string }>;
   failed?: Array<{ file_id?: string; file_name?: string; error?: string }>;
   skipped?: Array<{ file_id?: string; name?: string; reason?: string }>;
@@ -139,9 +140,16 @@ export type StreamHandlers = {
   onError?: (payload: Record<string, unknown>) => void;
 };
 
-export async function streamChat(message: string, conversationId: string | undefined, activeFileId: string | undefined, handlers: StreamHandlers) {
+export async function streamChat(
+  message: string,
+  conversationId: string | undefined,
+  activeFileId: string | undefined,
+  handlers: StreamHandlers,
+  signal?: AbortSignal
+) {
   const response = await fetch(`${API_BASE}/chat/stream`, {
     method: "POST",
+    signal,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token()}`
@@ -171,6 +179,15 @@ export async function streamChat(message: string, conversationId: string | undef
     }
   }
 }
+
+export type BatchStreamHandlers = {
+  onMeta?: (payload: Record<string, unknown>) => void;
+  onProgress?: (payload: Record<string, unknown>) => void;
+  onItem?: (payload: Record<string, unknown>) => void;
+  onDone?: (payload: BatchGenerateResult) => void;
+  onCancelled?: (payload: Record<string, unknown>) => void;
+  onError?: (payload: Record<string, unknown>) => void;
+};
 
 export function uploadJava(file: File) {
   const form = new FormData();
@@ -215,6 +232,58 @@ export function generateTestsBatch(fileIds?: string[], onlyMissing = true) {
       max_files: 200,
       goal: "Generate JUnit 4 tests for all selected Java files."
     })
+  });
+}
+
+export async function streamGenerateTestsBatch(
+  fileIds: string[] | undefined,
+  onlyMissing: boolean,
+  jobId: string,
+  handlers: BatchStreamHandlers,
+  signal?: AbortSignal
+) {
+  const response = await fetch(`${API_BASE}/files/generate/batch/stream`, {
+    method: "POST",
+    signal,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token()}`
+    },
+    body: JSON.stringify({
+      file_ids: fileIds && fileIds.length ? fileIds : undefined,
+      only_missing: onlyMissing,
+      max_files: 200,
+      job_id: jobId,
+      goal: "Generate JUnit 4 tests for all selected Java files."
+    })
+  });
+  if (!response.ok || !response.body) throw new Error(await response.text());
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop() || "";
+    for (const raw of events) {
+      const event = raw.match(/^event:\s*(.+)$/m)?.[1] || "message";
+      const dataLine = raw.match(/^data:\s*(.+)$/m)?.[1] || "{}";
+      const payload = JSON.parse(dataLine) as Record<string, unknown>;
+      if (event === "meta") handlers.onMeta?.(payload);
+      if (event === "progress") handlers.onProgress?.(payload);
+      if (event === "item") handlers.onItem?.(payload);
+      if (event === "done") handlers.onDone?.(payload as BatchGenerateResult);
+      if (event === "cancelled") handlers.onCancelled?.(payload);
+      if (event === "error") handlers.onError?.(payload);
+    }
+  }
+}
+
+export function cancelBatchGenerate(jobId: string) {
+  return request<{ ok: boolean; job_id: string; cancelled: boolean }>(`/files/generate/batch/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST"
   });
 }
 

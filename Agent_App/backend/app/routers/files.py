@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
+import uuid
 import zipfile
 from pathlib import Path
 from typing import BinaryIO
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+import anyio
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -23,12 +26,13 @@ from app.schemas import (
     UploadedFileOut,
 )
 from app.security import get_current_user
-from app.services.agent_service import AgentService
+from app.services.agent_service import AgentService, GenerationCancelled
 from app.services.java_analysis import analyze_java_source
 from app.services.storage_service import put_object, remove_object
 
 
 router = APIRouter(prefix="/files", tags=["files"])
+CANCELLED_BATCH_JOBS: set[str] = set()
 
 ZIP_IGNORED_DIRS = {
     ".git",
@@ -41,6 +45,10 @@ ZIP_IGNORED_DIRS = {
     "out",
     "target",
 }
+
+
+def sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
 
 def safe_name(name: str) -> str:
@@ -452,6 +460,198 @@ def generate_tests_batch(
             "max_files": payload.max_files,
             "goal": payload.goal,
         }
+    )
+
+
+@router.post("/generate/batch/{job_id}/cancel")
+def cancel_generate_batch(job_id: str, user: User = Depends(get_current_user)):
+    CANCELLED_BATCH_JOBS.add(f"{user.id}:{job_id}")
+    return {"ok": True, "job_id": job_id, "cancelled": True}
+
+
+@router.post("/generate/batch/stream")
+def generate_tests_batch_stream(
+    payload: BatchGenerateIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    service = AgentService(db, user)
+    job_id = payload.job_id or uuid.uuid4().hex
+    cancel_key = f"{user.id}:{job_id}"
+    CANCELLED_BATCH_JOBS.discard(cancel_key)
+
+    def client_disconnected() -> bool:
+        try:
+            return anyio.from_thread.run(request.is_disconnected)
+        except RuntimeError:
+            return False
+
+    def cancelled() -> bool:
+        return cancel_key in CANCELLED_BATCH_JOBS or client_disconnected()
+
+    def generate():
+        generated: list[dict[str, object]] = []
+        failed: list[dict[str, object]] = []
+        skipped: list[dict[str, object]] = []
+        try:
+            selected, initial_skipped, meta = service.batch_generation_plan(
+                {
+                    "file_ids": payload.file_ids or [],
+                    "only_missing": payload.only_missing,
+                    "max_files": payload.max_files,
+                    "goal": payload.goal,
+                }
+            )
+            skipped.extend(initial_skipped)
+            total = len(selected)
+            yield sse(
+                "meta",
+                {
+                    "job_id": job_id,
+                    "total": total,
+                    "skipped_count": len(skipped),
+                    "requested": meta["requested"],
+                    "only_missing": meta["only_missing"],
+                },
+            )
+            for item in skipped:
+                yield sse(
+                    "item",
+                    {"kind": "skipped", **item, "generated_count": 0, "failed_count": 0, "skipped_count": len(skipped)},
+                )
+            if total == 0:
+                yield sse(
+                    "done",
+                    {
+                        "ok": True,
+                        "tool": "batch_generate_tests",
+                        **meta,
+                        "selected_count": 0,
+                        "generated_count": 0,
+                        "skipped_count": len(skipped),
+                        "failed_count": 0,
+                        "generated": generated,
+                        "skipped": skipped,
+                        "failed": failed,
+                    },
+                )
+                return
+
+            for index, row in enumerate(selected, start=1):
+                if cancelled():
+                    yield sse(
+                        "cancelled",
+                        {
+                            "job_id": job_id,
+                            "processed": index - 1,
+                            "total": total,
+                            "generated_count": len(generated),
+                            "skipped_count": len(skipped),
+                            "failed_count": len(failed),
+                        },
+                    )
+                    return
+                file_label = (row.analysis or {}).get("_project_relative_path") or row.original_name
+                yield sse(
+                    "progress",
+                    {
+                        "job_id": job_id,
+                        "current": index - 1,
+                        "total": total,
+                        "percent": round(((index - 1) / total) * 100, 2),
+                        "file_id": row.id,
+                        "file_name": file_label,
+                        "stage": "generating",
+                        "message": f"正在生成 {index}/{total}: {file_label}",
+                    },
+                )
+                try:
+                    result = service.tool_generate_tests({"file_id": row.id, "goal": payload.goal}, cancel_check=cancelled)
+                    item = {
+                        "file_id": row.id,
+                        "file_name": row.original_name,
+                        "class_name": (row.analysis or {}).get("class_name"),
+                        "artifact_id": result.get("artifact_id"),
+                        "artifact_file": result.get("file_name"),
+                        "used_model": result.get("used_model"),
+                    }
+                    generated.append(item)
+                    yield sse(
+                        "item",
+                        {
+                            "kind": "generated",
+                            **item,
+                            "generated_count": len(generated),
+                            "skipped_count": len(skipped),
+                            "failed_count": len(failed),
+                        },
+                    )
+                except GenerationCancelled:
+                    db.rollback()
+                    yield sse(
+                        "cancelled",
+                        {
+                            "job_id": job_id,
+                            "processed": index - 1,
+                            "total": total,
+                            "generated_count": len(generated),
+                            "skipped_count": len(skipped),
+                            "failed_count": len(failed),
+                        },
+                    )
+                    return
+                except Exception as exc:
+                    db.rollback()
+                    item = {"file_id": row.id, "file_name": row.original_name, "error": f"{type(exc).__name__}: {exc}"}
+                    failed.append(item)
+                    yield sse(
+                        "item",
+                        {
+                            "kind": "failed",
+                            **item,
+                            "generated_count": len(generated),
+                            "skipped_count": len(skipped),
+                            "failed_count": len(failed),
+                        },
+                    )
+                yield sse(
+                    "progress",
+                    {
+                        "job_id": job_id,
+                        "current": index,
+                        "total": total,
+                        "percent": round((index / total) * 100, 2),
+                        "stage": "done",
+                        "message": f"已处理 {index}/{total}",
+                    },
+                )
+
+            yield sse(
+                "done",
+                {
+                    "ok": not failed,
+                    "tool": "batch_generate_tests",
+                    **meta,
+                    "selected_count": total,
+                    "generated_count": len(generated),
+                    "skipped_count": len(skipped),
+                    "failed_count": len(failed),
+                    "generated": generated,
+                    "skipped": skipped,
+                    "failed": failed,
+                },
+            )
+        except Exception as exc:
+            db.rollback()
+            yield sse("error", {"detail": f"{type(exc).__name__}: {exc}"})
+        finally:
+            CANCELLED_BATCH_JOBS.discard(cancel_key)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

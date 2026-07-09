@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from openai import OpenAI
 from sqlalchemy.orm import Session
@@ -20,6 +20,10 @@ from app.models import AgentMemory, GeneratedArtifact, MessageFeedback, ToolCall
 from app.services import a3_tools
 from app.services.java_analysis import junit4_scaffold
 from app.services.storage_service import put_object
+
+
+class GenerationCancelled(Exception):
+    pass
 
 
 def extract_java(text: str) -> str:
@@ -438,7 +442,7 @@ class AgentService:
         self.user = user
 
     def llm_client(self) -> OpenAI:
-        kwargs: dict[str, Any] = {"api_key": settings.openai_api_key, "timeout": 120, "max_retries": 0}
+        kwargs: dict[str, Any] = {"api_key": settings.openai_api_key, "timeout": 90, "max_retries": 0}
         if settings.openai_base_url:
             kwargs["base_url"] = settings.openai_base_url
         return OpenAI(**kwargs)
@@ -508,7 +512,7 @@ class AgentService:
             "analysis": file.analysis,
         }
 
-    def tool_generate_tests(self, args: dict[str, Any]) -> dict[str, Any]:
+    def tool_generate_tests(self, args: dict[str, Any], cancel_check: Callable[[], bool] | None = None) -> dict[str, Any]:
         file = self._owned_file(args["file_id"])
         source = Path(file.storage_path).read_text(encoding="utf-8", errors="replace")
         goal = args.get("goal") or "Generate JUnit 4 tests with edge cases and exception paths."
@@ -526,25 +530,53 @@ class AgentService:
                 f"Source:\n{source[:18000]}"
             )
             try:
+                if cancel_check and cancel_check():
+                    raise GenerationCancelled("generation cancelled")
                 client = self.llm_client()
-                response = client.chat.completions.create(
-                    model=settings.openai_model,
-                    messages=[
-                        {"role": "system", "content": "You generate Java JUnit 4 tests for uploaded source files."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.2,
-                )
-                code = extract_java(response.choices[0].message.content or "")
+                messages = [
+                    {"role": "system", "content": "You generate Java JUnit 4 tests for uploaded source files."},
+                    {"role": "user", "content": prompt},
+                ]
+                if cancel_check:
+                    parts: list[str] = []
+                    stream = client.chat.completions.create(
+                        model=settings.openai_model,
+                        messages=messages,
+                        temperature=0.2,
+                        stream=True,
+                    )
+                    for chunk in stream:
+                        if cancel_check():
+                            close_stream = getattr(stream, "close", None)
+                            if callable(close_stream):
+                                close_stream()
+                            raise GenerationCancelled("generation cancelled")
+                        if not chunk.choices:
+                            continue
+                        text = getattr(chunk.choices[0].delta, "content", None)
+                        if text:
+                            parts.append(text)
+                    code = extract_java("".join(parts))
+                else:
+                    response = client.chat.completions.create(
+                        model=settings.openai_model,
+                        messages=messages,
+                        temperature=0.2,
+                    )
+                    code = extract_java(response.choices[0].message.content or "")
                 if not code.strip():
                     raise ValueError("model returned empty test code")
                 model_used = settings.openai_model
+            except GenerationCancelled:
+                raise
             except Exception as exc:
                 code = junit4_scaffold(file.analysis)
                 prompt += f"\n\nLLM generation failed; local scaffold used: {type(exc).__name__}: {exc}"
         else:
             code = junit4_scaffold(file.analysis)
 
+        if cancel_check and cancel_check():
+            raise GenerationCancelled("generation cancelled")
         class_name = file.analysis.get("class_name") or Path(file.original_name).stem
         artifact_dir = settings.storage_dir / "generated" / self.user.id / file.id
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -578,6 +610,32 @@ class AgentService:
             "used_model": bool(model_used),
             "code_chars": len(code),
         }
+
+    def batch_generation_plan(self, args: dict[str, Any]) -> tuple[list[UploadedFile], list[dict[str, Any]], dict[str, Any]]:
+        only_missing = bool(args.get("only_missing", True))
+        max_files = max(1, min(int(args.get("max_files", 50)), 200))
+        file_ids = args.get("file_ids") or []
+        query = self.db.query(UploadedFile).filter(UploadedFile.user_id == self.user.id)
+        if file_ids:
+            query = query.filter(UploadedFile.id.in_(file_ids))
+        rows = query.order_by(UploadedFile.created_at.asc()).all()
+
+        selected: list[UploadedFile] = []
+        skipped: list[dict[str, Any]] = []
+        for row in rows:
+            if only_missing and self.has_test_artifact(row.id):
+                skipped.append({"file_id": row.id, "name": row.original_name, "reason": "already_has_test_artifact"})
+                continue
+            selected.append(row)
+            if len(selected) >= max_files:
+                break
+
+        meta = {
+            "requested": len(file_ids) if file_ids else "all_uploaded_files",
+            "only_missing": only_missing,
+            "max_files": max_files,
+        }
+        return selected, skipped, meta
 
     def has_test_artifact(self, file_id: str) -> bool:
         return (
@@ -620,24 +678,8 @@ class AgentService:
         return {"ok": True, "tool": "list_files", "files": files, "count": len(files), "only_missing_tests": only_missing}
 
     def tool_batch_generate_tests(self, args: dict[str, Any]) -> dict[str, Any]:
-        only_missing = bool(args.get("only_missing", True))
-        max_files = max(1, min(int(args.get("max_files", 50)), 200))
         goal = args.get("goal") or "Generate JUnit 4 tests for all selected Java files."
-        file_ids = args.get("file_ids") or []
-        query = self.db.query(UploadedFile).filter(UploadedFile.user_id == self.user.id)
-        if file_ids:
-            query = query.filter(UploadedFile.id.in_(file_ids))
-        rows = query.order_by(UploadedFile.created_at.asc()).all()
-
-        selected: list[UploadedFile] = []
-        skipped: list[dict[str, Any]] = []
-        for row in rows:
-            if only_missing and self.has_test_artifact(row.id):
-                skipped.append({"file_id": row.id, "name": row.original_name, "reason": "already_has_test_artifact"})
-                continue
-            selected.append(row)
-            if len(selected) >= max_files:
-                break
+        selected, skipped, meta = self.batch_generation_plan(args)
 
         generated: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
@@ -666,9 +708,7 @@ class AgentService:
         return {
             "ok": not failed,
             "tool": "batch_generate_tests",
-            "requested": len(file_ids) if file_ids else "all_uploaded_files",
-            "only_missing": only_missing,
-            "max_files": max_files,
+            **meta,
             "generated_count": len(generated),
             "failed_count": len(failed),
             "skipped_count": len(skipped),
@@ -1325,12 +1365,16 @@ class AgentService:
         failure_tokens = ["compile", "fail", "error", "编译", "不过", "失败", "报错", "修复"]
         history_tokens = ["previous", "history", "artifact", "之前", "历史", "上次", "产物"]
         if normalized["intent"] == "batch_generate_tests":
-            result = self.tool_batch_generate_tests({"only_missing": True, "max_files": 200, "goal": message})
+            result = {
+                "ok": False,
+                "tool": "batch_generate_tests",
+                "blocked": True,
+                "reason": "批量生成已迁移到可中断 SSE 任务，普通对话流不会启动长时间批处理。",
+            }
             results.append(result)
             reply = (
-                f"已批量生成 {result.get('generated_count', 0)} 个测试产物；"
-                f"跳过 {result.get('skipped_count', 0)} 个，"
-                f"失败 {result.get('failed_count', 0)} 个。"
+                "为了避免普通对话里出现不可中断的长时间批处理，批量生成现在需要走右侧 Java 文件面板里的"
+                "“生成未测”或项目组里的“生成项目未测”按钮。那里会显示真实进度，并支持强制中断。"
             )
         elif file_id and normalized["intent"] == "explain_latest_test":
             latest = self.latest_artifact_for_file(file_id)
@@ -1530,6 +1574,7 @@ class AgentService:
 
         normalized = normalize_user_request(message, file_id)
         if normalized["mode"] in {"act", "read"} or normalized["intent"] != "chat":
+            yield {"event": "status", "message": f"正在执行：{normalized['canonical']}"}
             reply, tool_results = self.scripted_chat(message, file_id)
             for result in tool_results:
                 yield {"event": "tool", "data": result}
@@ -1730,6 +1775,29 @@ class AgentService:
         )
         return destination
 
+    def force_maven_java8(self, work_project: Path) -> None:
+        pom = work_project / "pom.xml"
+        if not pom.exists():
+            return
+        text = pom.read_text(encoding="utf-8", errors="replace")
+        updated = text
+        replacements = {
+            r"(<maven\.compiler\.source>\s*)(?:1\.)?[5-7](\s*</maven\.compiler\.source>)": r"\g<1>1.8\2",
+            r"(<maven\.compiler\.target>\s*)(?:1\.)?[5-7](\s*</maven\.compiler\.target>)": r"\g<1>1.8\2",
+            r"(<source>\s*)(?:1\.)?[5-7](\s*</source>)": r"\g<1>1.8\2",
+            r"(<target>\s*)(?:1\.)?[5-7](\s*</target>)": r"\g<1>1.8\2",
+        }
+        for pattern, replacement in replacements.items():
+            updated = re.sub(pattern, replacement, updated)
+        if "<maven.compiler.source>" not in updated and "<properties>" in updated:
+            updated = updated.replace(
+                "<properties>",
+                "<properties>\n    <maven.compiler.source>1.8</maven.compiler.source>\n    <maven.compiler.target>1.8</maven.compiler.target>",
+                1,
+            )
+        if updated != text:
+            pom.write_text(updated, encoding="utf-8")
+
     def compile_maven_artifact(self, artifact: GeneratedArtifact, file: UploadedFile, project_root: Path) -> dict[str, Any]:
         mvn = shutil.which("mvn")
         if not mvn:
@@ -1739,11 +1807,12 @@ class AgentService:
         with tempfile.TemporaryDirectory(prefix="maven_compile_", dir=run_root) as tmp_dir:
             tmp = Path(tmp_dir)
             work_project = self.copy_project_for_run(project_root, tmp)
+            self.force_maven_java8(work_project)
             code, test_rel_path, test_class = self.project_test_code_and_path(file, artifact)
             target = work_project / test_rel_path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(code, encoding="utf-8")
-            command = [mvn, "-q", "-DskipTests", "test-compile"]
+            command = [mvn, "-q", "-Dmaven.compiler.source=1.8", "-Dmaven.compiler.target=1.8", "-DskipTests", "test-compile"]
             completed = subprocess.run(
                 command,
                 cwd=work_project,
@@ -1775,6 +1844,7 @@ class AgentService:
         with tempfile.TemporaryDirectory(prefix="maven_coverage_", dir=run_root) as tmp_dir:
             tmp = Path(tmp_dir)
             work_project = self.copy_project_for_run(project_root, tmp)
+            self.force_maven_java8(work_project)
             code, test_rel_path, test_class = self.project_test_code_and_path(file, artifact)
             target = work_project / test_rel_path
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -1782,6 +1852,8 @@ class AgentService:
             command = [
                 mvn,
                 "-q",
+                "-Dmaven.compiler.source=1.8",
+                "-Dmaven.compiler.target=1.8",
                 "org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent",
                 "test",
                 "org.jacoco:jacoco-maven-plugin:0.8.12:report",

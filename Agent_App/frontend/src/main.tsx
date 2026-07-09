@@ -13,6 +13,7 @@ import {
   Plus,
   RefreshCw,
   Send,
+  Square,
   ThumbsDown,
   ThumbsUp,
   Trash2,
@@ -25,13 +26,13 @@ import {
   Conversation,
   Message,
   UploadedFile,
+  cancelBatchGenerate,
   createConversation,
   deleteConversation,
   deleteUploadedFile,
   deleteUploadedFiles,
   downloadArtifact,
   downloadArtifactsZip,
-  generateTestsBatch,
   getArtifacts,
   getConversations,
   getFiles,
@@ -42,6 +43,7 @@ import {
   rateMessage,
   readArtifact,
   register,
+  streamGenerateTestsBatch,
   streamChat,
   uploadJavaBatch
 } from "./api";
@@ -104,6 +106,9 @@ type TaskModalState = {
   title: string;
   detail: string;
   progress: number;
+  indeterminate?: boolean;
+  cancelled?: boolean;
+  jobId?: string;
   files: UploadedFile[];
   rejected: Array<{ name: string; reason: string }>;
   result?: BatchGenerateResult;
@@ -203,6 +208,8 @@ function App() {
   const [previewOpen, setPreviewOpen] = useState(false);
   const [taskModal, setTaskModal] = useState<TaskModalState>(emptyTask);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const chatAbortRef = useRef<AbortController | null>(null);
+  const batchAbortRef = useRef<{ controller: AbortController; jobId: string } | null>(null);
 
   const activeFile = useMemo(() => files.find((file) => file.id === activeFileId), [files, activeFileId]);
   const activeProjectId = activeFile?.analysis._project_id;
@@ -281,16 +288,16 @@ function App() {
   }, [messages, status]);
 
   useEffect(() => {
-    if (!taskModal.open || !taskModal.running) return;
+    if (!taskModal.open || !taskModal.running || !taskModal.indeterminate) return;
     const timer = window.setInterval(() => {
       setTaskModal((current) =>
-        current.open && current.running
+        current.open && current.running && current.indeterminate
           ? { ...current, progress: Math.min(92, current.progress + (current.progress < 45 ? 8 : 3)) }
           : current
       );
     }, 650);
     return () => window.clearInterval(timer);
-  }, [taskModal.open, taskModal.running]);
+  }, [taskModal.open, taskModal.running, taskModal.indeterminate]);
 
   useEffect(() => {
     setTypedSuggestion("");
@@ -378,6 +385,12 @@ function App() {
 
   async function generateForFiles(fileIds: string[], title: string, onlyMissing = true) {
     if (busy || !fileIds.length) return;
+    const jobId =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const controller = new AbortController();
+    batchAbortRef.current = { controller, jobId };
     setBusy(true);
     setStatus(title);
     setTaskModal({
@@ -385,20 +398,114 @@ function App() {
       running: true,
       title,
       detail: `准备处理 ${fileIds.length} 个 Java 文件`,
-      progress: 8,
+      progress: 0,
+      indeterminate: false,
+      cancelled: false,
+      jobId,
       files: files.filter((file) => fileIds.includes(file.id)),
       rejected: []
     });
     try {
-      const result = await generateTestsBatch(fileIds, onlyMissing);
+      let finalResult: BatchGenerateResult | undefined;
+      await streamGenerateTestsBatch(
+        fileIds,
+        onlyMissing,
+        jobId,
+        {
+          onMeta: (payload) => {
+            const total = Number(payload.total || fileIds.length);
+            const skipped = Number(payload.skipped_count || 0);
+            setTaskModal((current) => ({
+              ...current,
+              detail: `真实进度：待生成 ${total} 个，已跳过 ${skipped} 个`,
+              progress: total ? 0 : 100,
+              result: {
+                generated_count: 0,
+                skipped_count: skipped,
+                failed_count: 0,
+                generated: [],
+                skipped: [],
+                failed: []
+              }
+            }));
+          },
+          onProgress: (payload) => {
+            const percent = Number(payload.percent || 0);
+            const message = String(payload.message || title);
+            setStatus(message);
+            setTaskModal((current) => ({
+              ...current,
+              progress: Math.max(0, Math.min(100, percent)),
+              detail: message
+            }));
+          },
+          onItem: (payload) => {
+            const generated = Number(payload.generated_count || 0);
+            const skipped = Number(payload.skipped_count || 0);
+            const failed = Number(payload.failed_count || 0);
+            setTaskModal((current) => ({
+              ...current,
+              result: {
+                ...(current.result || {}),
+                generated_count: generated,
+                skipped_count: skipped,
+                failed_count: failed
+              }
+            }));
+          },
+          onDone: (payload) => {
+            finalResult = payload;
+            const generated = Number(payload.generated_count || 0);
+            const skipped = Number(payload.skipped_count || 0);
+            const failed = Number(payload.failed_count || 0);
+            setTaskModal((current) => ({
+              ...current,
+              running: false,
+              progress: 100,
+              detail: `完成：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个`,
+              result: payload
+            }));
+          },
+          onCancelled: (payload) => {
+            const generated = Number(payload.generated_count || 0);
+            const skipped = Number(payload.skipped_count || 0);
+            const failed = Number(payload.failed_count || 0);
+            finalResult = {
+              ok: false,
+              cancelled: true,
+              generated_count: generated,
+              skipped_count: skipped,
+              failed_count: failed
+            };
+            setTaskModal((current) => ({
+              ...current,
+              running: false,
+              cancelled: true,
+              detail: `已中断：已生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个`,
+              result: finalResult
+            }));
+          },
+          onError: (payload) => {
+            throw new Error(String(payload.detail || "批量生成失败"));
+          }
+        },
+        controller.signal
+      );
+      if (controller.signal.aborted) {
+        finalResult = finalResult || { ok: false, cancelled: true };
+      }
+      const result: BatchGenerateResult = finalResult || { ok: true, generated_count: 0, skipped_count: 0, failed_count: 0 };
       const generated = Number(result.generated_count || 0);
       const skipped = Number(result.skipped_count || 0);
       const failed = Number(result.failed_count || 0);
       setTaskModal((current) => ({
         ...current,
         running: false,
-        progress: 100,
-        detail: `完成：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个`,
+        progress: result.cancelled ? current.progress : 100,
+        cancelled: Boolean(result.cancelled),
+        detail: result.cancelled
+          ? `已中断：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个`
+          : `完成：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个`,
         result
       }));
       setMessages((current) => [
@@ -406,13 +513,24 @@ function App() {
         {
           id: `local-batch-${Date.now()}`,
           role: "assistant",
-          content: `已完成批量生成：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个。`,
+          content: result.cancelled
+            ? `批量生成已中断：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个。`
+            : `已完成批量生成：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个。`,
           tool_results: { items: [result] },
           created_at: new Date().toISOString()
         }
       ]);
       await Promise.all([refresh(), activeFileId ? getArtifacts(activeFileId).then(setArtifacts) : Promise.resolve()]);
     } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setTaskModal((current) => ({
+          ...current,
+          running: false,
+          cancelled: true,
+          detail: "已请求中断；后端会停止继续处理后续文件"
+        }));
+        return;
+      }
       setTaskModal((current) => ({
         ...current,
         running: false,
@@ -420,6 +538,7 @@ function App() {
         detail: err instanceof Error ? err.message : "批量生成失败"
       }));
     } finally {
+      batchAbortRef.current = null;
       setBusy(false);
       setStatus("");
     }
@@ -454,6 +573,8 @@ function App() {
     };
     setMessages((current) => [...current, userMessage, assistantMessage]);
     try {
+      const controller = new AbortController();
+      chatAbortRef.current = controller;
       await streamChat(message, conversationId, activeFileId, {
         onMeta: (payload) => {
           if (typeof payload.conversation_id === "string") setConversationId(payload.conversation_id);
@@ -490,8 +611,17 @@ function App() {
             )
           );
         }
-      });
+      }, controller.signal);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setMessages((current) =>
+          current.map((item) => (item.id === assistantId ? { ...item, content: item.content || "已中断本轮对话。" } : item))
+        );
+      } else {
+        throw err;
+      }
     } finally {
+      chatAbortRef.current = null;
       setBusy(false);
       setStatus("");
     }
@@ -508,6 +638,8 @@ function App() {
       title: hasZip ? "上传并解析项目 zip" : "上传 Java 文件",
       detail: `正在上传 ${accepted.length} 个文件`,
       progress: 8,
+      indeterminate: true,
+      cancelled: false,
       files: [],
       rejected: []
     });
@@ -545,10 +677,26 @@ function App() {
   }
 
   function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Tab" && typedSuggestion) {
+    if (event.key === "Tab" && typedSuggestion && !input.trim()) {
       event.preventDefault();
       setInput(typedSuggestion);
     }
+  }
+
+  async function cancelCurrentWork() {
+    const batch = batchAbortRef.current;
+    if (batch) {
+      cancelBatchGenerate(batch.jobId).catch(console.error);
+      batch.controller.abort();
+      setTaskModal((current) =>
+        current.open && current.running
+          ? { ...current, running: false, cancelled: true, detail: "已请求中断；后端会停止继续处理后续文件" }
+          : current
+      );
+    }
+    chatAbortRef.current?.abort();
+    setBusy(false);
+    setStatus("");
   }
 
   async function loadWorkspace() {
@@ -677,9 +825,16 @@ function App() {
               />
               <div className="composer-footer">
                 <span>{text.tabHint}</span>
-                <button className="send-btn" disabled={busy} type="submit">
-                  <Send size={18} />
-                </button>
+                <div className="composer-actions">
+                  {busy && (
+                    <button className="stop-btn" type="button" title="中断当前任务" onClick={() => cancelCurrentWork().catch(console.error)}>
+                      <Square size={16} />
+                    </button>
+                  )}
+                  <button className="send-btn" disabled={busy} type="submit">
+                    <Send size={18} />
+                  </button>
+                </div>
               </div>
             </form>
           </section>
@@ -854,6 +1009,12 @@ function App() {
                     生成这些 Java
                   </button>
                 )}
+                {taskModal.running && taskModal.jobId && (
+                  <button type="button" className="danger-action" onClick={() => cancelCurrentWork().catch(console.error)}>
+                    <Square size={15} />
+                    强制中断
+                  </button>
+                )}
                 <button type="button" onClick={() => setTaskModal(emptyTask)} disabled={taskModal.running}>
                   {text.close}
                 </button>
@@ -866,7 +1027,7 @@ function App() {
               </div>
               <div className="task-stats">
                 <span>{Math.round(taskModal.progress)}%</span>
-                <span>{taskModal.running ? "处理中" : "完成"}</span>
+                <span>{taskModal.running ? "处理中" : taskModal.cancelled ? "已中断" : "完成"}</span>
               </div>
 
               {!!taskModal.files.length && (

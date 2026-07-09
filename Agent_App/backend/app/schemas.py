@@ -112,6 +112,7 @@ class BatchGenerateIn(BaseModel):
     only_missing: bool = True
     max_files: int = Field(default=50, ge=1, le=200)
     goal: str = "Generate JUnit 4 tests for all selected Java files."
+    job_id: str | None = None
 
 
 class ArtifactOut(BaseModel):

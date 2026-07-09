@@ -128,6 +128,7 @@ textarea:focus {
 .new-chat-btn,
 .header-actions button,
 .send-btn,
+.stop-btn,
 .upload-actions label,
 .artifact-actions button,
 .modal-actions button,
@@ -216,6 +217,20 @@ textarea:focus {
   min-height: 0;
   overflow: auto;
   padding-right: 2px;
+}
+
+.conversation-row,
+.file-row,
+.artifact-row,
+.project-group,
+.project-header,
+.list-item,
+.artifact-main,
+.side-section,
+.task-modal,
+.modal-header,
+.task-file-row {
+  min-width: 0;
 }
 
 .files-list {
@@ -484,12 +499,29 @@ details code,
   font-size: 12px;
 }
 
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .send-btn {
   display: grid;
   width: 42px;
   height: 42px;
   min-height: 42px;
   place-items: center;
+}
+
+.stop-btn {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  min-height: 42px;
+  place-items: center;
+  border-color: rgba(188, 63, 74, 0.35);
+  background: #fff4f4;
+  color: var(--red);
 }
 
 .right-rail {
@@ -543,9 +575,10 @@ details code,
 
 .compact-actions button {
   justify-content: center;
+  min-width: 0;
   min-height: 34px;
   padding: 0 10px;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .json-box {
@@ -599,6 +632,12 @@ details code,
 .modal-actions {
   justify-content: flex-end;
   flex-wrap: wrap;
+}
+
+.modal-actions .danger-action {
+  border-color: rgba(188, 63, 74, 0.35);
+  background: #fff4f4;
+  color: var(--red);
 }
 
 .modal-code {
@@ -675,6 +714,7 @@ details code,
 .task-file-row strong,
 .task-file-row span {
   overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .task-file-row span {
