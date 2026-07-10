@@ -22,6 +22,7 @@ from app.services import a3_tools
 from app.services.code_context_service import build_code_context, format_code_context_answer, infer_context_field
 from app.services.java_analysis import junit4_scaffold
 from app.services.prompt_service import render_generation_prompt, render_repair_prompt
+from app.services.skills import DEFAULT_SKILL_REGISTRY
 from app.services.source_selection import file_source_name, is_uploaded_test_source, source_role_analysis, test_source_reason
 from app.services.storage_service import put_object
 
@@ -380,6 +381,15 @@ def coverage_summary_text(coverage: Any) -> str:
     return f"已完成 JaCoCo 覆盖率。`{class_name}`：{metrics}。"
 
 
+def format_skill_catalog(skills: list[dict[str, Any]]) -> str:
+    lines = ["当前 agent 已注册这些 skills："]
+    for skill in skills:
+        tools = "、".join(skill.get("tools") or [])
+        side_effect = "会改状态/消耗资源" if skill.get("side_effecting") else "只读"
+        lines.append(f"- `{skill.get('id')}`：{skill.get('summary')} 工具：{tools}。策略：{side_effect}。")
+    return "\n".join(lines)
+
+
 def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
     lower = message.lower()
     intent = "chat"
@@ -500,6 +510,9 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
     elif any(token in lower for token in ["analyze", "method", "分析", "方法"]):
         intent = "analyze_file" if file_id else "chat"
         mode = "read" if intent == "analyze_file" else "ask"
+    elif any(token in lower for token in ["skill", "skills", "技能", "能力"]):
+        intent = "list_skills"
+        mode = "read"
     elif any(token in lower for token in ["remember", "记住"]):
         intent = "remember"
         mode = "act"
@@ -515,9 +528,11 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
         "explain_latest_test": "Explain what the latest generated JUnit test is testing. This is read-only.",
         "list_artifacts": "List generated artifacts for the active Java file. This is read-only.",
         "analyze_file": "Analyze the active Java file structure. This is read-only.",
+        "list_skills": "List the agent skills, their tool boundaries, and their risk profile.",
         "remember": "Store a stable user preference or project fact.",
         "chat": "Answer in Chinese without changing state. Read-only tools are allowed only when the intent is normalized to read mode.",
     }
+    skill = DEFAULT_SKILL_REGISTRY.for_intent(intent, mode)
     return {
         "raw": message,
         "language": "zh-CN",
@@ -527,6 +542,9 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
         "scope": "active_file" if file_id else "conversation",
         "active_file_id": file_id,
         "canonical": canonical_map[intent],
+        "skill_id": skill.id,
+        "skill": skill.brief(),
+        "allowed_tools": list(skill.tools),
     }
 
 
@@ -1392,11 +1410,19 @@ class AgentService:
             "memories": [{"key": memory.key, "value": memory.value} for memory in self.memories()],
         }
 
+    def tool_list_skills(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "tool": "list_skills",
+            "skills": DEFAULT_SKILL_REGISTRY.catalog(),
+        }
+
     def tool_remember(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.remember(args["key"], args["value"], "user-request")
 
     def tools(self) -> dict[str, Any]:
         return {
+            "list_skills": self.tool_list_skills,
             "inspect_workspace": self.tool_inspect_workspace,
             "validate_workspace": self.tool_validate_workspace,
             "prepare_feedback_round": self.tool_prepare_feedback_round,
@@ -1416,8 +1442,16 @@ class AgentService:
             "remember": self.tool_remember,
         }
 
-    def tool_schema(self) -> list[dict[str, Any]]:
-        return [
+    def tool_schema(self, skill_id: str | None = None) -> list[dict[str, Any]]:
+        schemas = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_skills",
+                    "description": "List the agent skill catalog, allowed tools, and side-effect policy.",
+                    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                },
+            },
             {
                 "type": "function",
                 "function": {
@@ -1655,6 +1689,7 @@ class AgentService:
                 },
             },
         ]
+        return DEFAULT_SKILL_REGISTRY.filter_tool_schemas(schemas, skill_id)
 
     def run_tool_with_policy(
         self,
@@ -1664,6 +1699,7 @@ class AgentService:
         file_id: str | None,
         seen_calls: set[str],
         call_counts: dict[str, int],
+        skill_id: str | None = None,
     ) -> dict[str, Any]:
         if name in {"analyze_file", "read_code_context", "generate_tests", "list_artifacts"} and "file_id" not in args and file_id:
             args["file_id"] = file_id
@@ -1693,7 +1729,16 @@ class AgentService:
         }
         call_counts[name] = call_counts.get(name, 0) + 1
         key = tool_call_key(name, args)
-        if key in seen_calls:
+        if skill_id and not DEFAULT_SKILL_REGISTRY.allows_tool(skill_id, name):
+            skill = DEFAULT_SKILL_REGISTRY.get(skill_id)
+            result = {
+                "ok": False,
+                "tool": name,
+                "blocked": True,
+                "skill": skill.brief(),
+                "reason": f"Tool `{name}` is outside the selected skill `{skill.id}`.",
+            }
+        elif key in seen_calls:
             result = {
                 "ok": False,
                 "tool": name,
@@ -1715,8 +1760,10 @@ class AgentService:
                 result = self.tools()[name](args)
             except Exception as exc:
                 result = {"ok": False, "tool": name, "error": f"{type(exc).__name__}: {exc}"}
+        if "skill" not in result:
+            result["skill"] = DEFAULT_SKILL_REGISTRY.get(skill_id).brief() if skill_id else DEFAULT_SKILL_REGISTRY.for_tool(name).brief()
         if result.get("blocked"):
-            result["reason"] = "工具调用已被控制层拦截：同一轮不再重复读取或重复生成，请直接基于已有结果回答用户。"
+            result["reason"] = result.get("reason") or "工具调用已被控制层拦截：同一轮不再重复读取或重复生成，请直接基于已有结果回答用户。"
         compact = compact_tool_result(result)
         self.record_tool(conversation_id, name, args, compact)
         return compact
@@ -1730,7 +1777,11 @@ class AgentService:
 
         failure_tokens = ["compile", "fail", "error", "编译", "不过", "失败", "报错", "修复"]
         history_tokens = ["previous", "history", "artifact", "之前", "历史", "上次", "产物"]
-        if normalized["intent"] == "batch_generate_tests":
+        if normalized["intent"] == "list_skills":
+            result = self.tool_list_skills({})
+            results.append(result)
+            reply = format_skill_catalog(result.get("skills") or [])
+        elif normalized["intent"] == "batch_generate_tests":
             result = {
                 "ok": False,
                 "tool": "batch_generate_tests",
@@ -1852,7 +1903,12 @@ class AgentService:
             results.append(self.tool_inspect_workspace({}))
             reply = "我已检查当前 A3 工作区。你也可以上传 Java 文件，然后让我生成、诊断、修复测试或运行覆盖率。"
 
-        return reply, [compact_tool_result(result) for result in results]
+        skill = DEFAULT_SKILL_REGISTRY.get(normalized.get("skill_id"))
+        compact_results = []
+        for result in results:
+            result.setdefault("skill", skill.brief())
+            compact_results.append(compact_tool_result(result))
+        return reply, compact_results
 
     def llm_chat(
         self,
@@ -1885,6 +1941,7 @@ class AgentService:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system},
             {"role": "system", "content": f"标准化用户输入:\n{json.dumps(normalized, ensure_ascii=False)}"},
+            {"role": "system", "content": f"Skill catalog:\n{DEFAULT_SKILL_REGISTRY.prompt_catalog(normalized.get('skill_id'))}"},
             {"role": "system", "content": f"Active file_id: {file_id or '<none>'}\nMemories:\n{memory_text or '<none>'}"},
             {"role": "system", "content": f"Recent user feedback:\n{feedback_text or '<none>'}"},
         ]
@@ -1907,7 +1964,7 @@ class AgentService:
                 response = client.chat.completions.create(
                     model=settings.openai_model,
                     messages=messages,
-                    tools=self.tool_schema(),
+                    tools=self.tool_schema(normalized.get("skill_id")),
                     tool_choice="auto",
                     temperature=0.2,
                 )
@@ -1927,7 +1984,15 @@ class AgentService:
 
                 for call in assistant.tool_calls:
                     args = json.loads(call.function.arguments or "{}")
-                    result = self.run_tool_with_policy(conversation_id, call.function.name, args, file_id, seen_calls, call_counts)
+                    result = self.run_tool_with_policy(
+                        conversation_id,
+                        call.function.name,
+                        args,
+                        file_id,
+                        seen_calls,
+                        call_counts,
+                        normalized.get("skill_id"),
+                    )
                     results.append(result)
                     if result.get("blocked"):
                         return "工具调用已被拦截，避免重复读取或循环生成。我已根据已有工具结果停止这轮调用。", results
@@ -1946,6 +2011,7 @@ class AgentService:
         return "工具调用达到本轮上限。我已停止继续调用，请根据已返回的工具结果判断下一步。", results
 
     def latest_coverage_events(self, conversation_id: str, file_id: str | None) -> Iterator[dict[str, Any]]:
+        coverage_skill = DEFAULT_SKILL_REGISTRY.for_intent("run_coverage", "act").brief()
         if not file_id:
             reply = "请先在右侧选择一个 Java 文件，再运行覆盖率。"
             for index in range(0, len(reply), 18):
@@ -1955,6 +2021,7 @@ class AgentService:
         file = self._owned_file(file_id)
         if is_uploaded_test_source(file):
             result = self.test_source_tool_rejection("run_coverage", file)
+            result.setdefault("skill", coverage_skill)
             compact = compact_tool_result(result)
             self.record_tool(conversation_id, "run_coverage", {"file_id": file_id}, compact)
             yield {"event": "tool", "data": compact}
@@ -1965,6 +2032,7 @@ class AgentService:
         latest = self.latest_artifact_for_file(file_id)
         if latest is None:
             result = self.tool_list_artifacts({"file_id": file_id})
+            result.setdefault("skill", coverage_skill)
             yield {"event": "tool", "data": result}
             reply = "当前文件还没有生成过测试产物。请先生成测试，再运行覆盖率。"
             for index in range(0, len(reply), 18):
@@ -1983,6 +2051,7 @@ class AgentService:
             }
             result = self.tool_run_coverage({"artifact_id": latest.id})
 
+        result.setdefault("skill", coverage_skill)
         compact = compact_tool_result(result)
         self.record_tool(conversation_id, "run_coverage", {"artifact_id": latest.id}, compact)
         yield {"event": "tool", "data": compact}
@@ -2032,6 +2101,7 @@ class AgentService:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system},
             {"role": "system", "content": f"标准化用户输入:\n{json.dumps(normalized, ensure_ascii=False)}"},
+            {"role": "system", "content": f"Skill catalog:\n{DEFAULT_SKILL_REGISTRY.prompt_catalog(normalized.get('skill_id'))}"},
             {"role": "system", "content": f"Active file_id: {file_id or '<none>'}\nMemories:\n{memory_text or '<none>'}"},
             {"role": "system", "content": f"Recent user feedback:\n{feedback_text or '<none>'}"},
         ]
@@ -2081,7 +2151,7 @@ class AgentService:
                 stream = client.chat.completions.create(
                     model=settings.openai_model,
                     messages=messages,
-                    tools=self.tool_schema(),
+                    tools=self.tool_schema(normalized.get("skill_id")),
                     tool_choice="auto",
                     temperature=0.2,
                     stream=True,
@@ -2131,7 +2201,15 @@ class AgentService:
                         args = {}
                         result = {"ok": False, "tool": name, "error": f"Invalid tool arguments: {exc}"}
                     else:
-                        result = self.run_tool_with_policy(conversation_id, name, args, file_id, seen_calls, call_counts)
+                        result = self.run_tool_with_policy(
+                            conversation_id,
+                            name,
+                            args,
+                            file_id,
+                            seen_calls,
+                            call_counts,
+                            normalized.get("skill_id"),
+                        )
                     yield {"event": "tool", "data": result}
                     if result.get("blocked"):
                         stop_reply = "工具调用已被拦截，避免重复读取或循环生成。我已根据已有工具结果停止这轮调用。"

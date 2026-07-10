@@ -79,6 +79,21 @@ OPENAI_MODEL=your-model-name
 - Validate existing A3 CSV and prompt artifacts.
 - Prepare feedback-driven generation rows through the existing A3 tools.
 
+## Agent skills
+
+The app now has an explicit skill layer in `backend/app/services/skills.py`. Skills group tools by intent and risk, so the agent does not expose every tool for every turn.
+
+- `general_chat`: answers conceptual questions and can read stable memories.
+- `workspace_ops`: lists skills, inspects the A3 workspace, validates A3 assets, and prepares legacy feedback rows.
+- `code_understanding`: lists uploaded files, analyzes Java structure, and reads extracted A3 context such as FQN, signatures, Jimple, fields, helpers, and throws.
+- `artifact_management`: lists, reads, and explains generated JUnit artifacts without creating new code.
+- `test_generation`: generates one test or runs batch test generation.
+- `coverage_analysis`: compiles generated artifacts and collects JaCoCo coverage.
+- `test_repair`: diagnoses compile/runtime failures and writes repaired artifacts.
+- `memory`: reads or stores stable user and project preferences.
+
+Every normalized chat turn carries `skill_id`, `skill`, and `allowed_tools`. Function-calling schemas are filtered by the selected skill, and the policy layer blocks tool calls outside that skill. The skill catalog is available through chat via the `list_skills` tool and through `GET /workspace/skills`.
+
 ## Agent loop guardrails
 
 The chat runtime normalizes every user message into a canonical intent before tool selection. Tool results are treated only as observations, not as new user instructions. This avoids attention hijacking where a large generated Java file or JSON tool payload pulls the model away from the user's actual request.
