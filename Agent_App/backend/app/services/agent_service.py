@@ -1935,8 +1935,8 @@ class AgentService:
         compact = compact_tool_result(result)
         self.record_tool(conversation_id, "run_coverage", {"artifact_id": latest.id}, compact)
         yield {"event": "tool", "data": compact}
-        if compact.get("ok"):
-            target = (compact.get("coverage") or {}).get("target") or {}
+        if result.get("ok"):
+            target = (result.get("coverage") or {}).get("target") or {}
             line = ((target.get("line") or {}).get("percent"))
             line_text = f"{line}%" if line is not None else "未识别"
             reply = f"已完成 JaCoCo 覆盖率。目标类行覆盖率：{line_text}。"
