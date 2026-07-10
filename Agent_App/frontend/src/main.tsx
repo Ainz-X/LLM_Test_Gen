@@ -7,6 +7,7 @@ import {
   Eye,
   FileArchive,
   FileCode2,
+  HelpCircle,
   History,
   LogOut,
   MoreVertical,
@@ -87,6 +88,11 @@ const text = {
   deleteSelectedFiles: "\u6279\u91cf\u5220",
   selectAll: "\u5168\u9009",
   batchGenerateMissing: "\u751f\u6210\u672a\u6d4b",
+  batchGenerateHelp: "优先为已勾选的生产源码生成测试；未勾选时会为全部尚未生成测试的生产源码创建测试，并排除测试源码。",
+  prodSources: "生产源码",
+  testSources: "测试源码",
+  noProdSources: "暂无生产源码",
+  noTestSources: "暂无测试源码",
   deleteConversation: "\u5220\u9664\u5bf9\u8bdd",
   renameConversation: "重命名",
   exportConversation: "导出对话",
@@ -159,6 +165,25 @@ function isTestSource(file: UploadedFile) {
 
 function generationTargets(fileList: UploadedFile[]) {
   return fileList.filter((file) => !isTestSource(file));
+}
+
+function stableMessageOrder(messageList: Message[]) {
+  return messageList
+    .map((message, index) => ({ message, index }))
+    .sort((left, right) => {
+      if (left.message.id.startsWith("local-") || right.message.id.startsWith("local-")) {
+        return left.index - right.index;
+      }
+      const leftTime = Date.parse(left.message.created_at || "");
+      const rightTime = Date.parse(right.message.created_at || "");
+      if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) {
+        return leftTime - rightTime;
+      }
+      const roleRank = (role: string) => (role === "user" ? 0 : role === "assistant" ? 1 : 2);
+      const rankDelta = roleRank(left.message.role) - roleRank(right.message.role);
+      return rankDelta || left.index - right.index;
+    })
+    .map((item) => item.message);
 }
 
 const emptyTask: TaskModalState = {
@@ -402,7 +427,8 @@ function App() {
   const contextAbortRef = useRef<{ controller: AbortController; jobId: string } | null>(null);
 
   const activeFile = useMemo(() => files.find((file) => file.id === activeFileId), [files, activeFileId]);
-  const messages = conversationId ? messagesByConversation[conversationId] || [] : [];
+  const rawMessages = conversationId ? messagesByConversation[conversationId] || [] : [];
+  const messages = useMemo(() => stableMessageOrder(rawMessages), [rawMessages]);
   const activeChatRun = conversationId ? chatRuns[conversationId] : undefined;
   const chatBusy = Boolean(activeChatRun);
   const fileGroups = useMemo<FileGroup[]>(() => {
@@ -1013,7 +1039,8 @@ function App() {
   async function submitChat(event?: FormEvent, preset?: string) {
     event?.preventDefault();
     const message = (preset ?? input).trim();
-    if (!message || busy) return;
+    if (!message) return;
+    const selectedIdsForRequest = [...selectedFileIds];
     let targetConversationId = conversationId;
     if (!targetConversationId) {
       const created = await createConversation(message.slice(0, 80) || text.newChat);
@@ -1043,7 +1070,7 @@ function App() {
     try {
       const controller = new AbortController();
       chatAbortRefs.current[targetConversationId] = controller;
-      await streamChat(message, targetConversationId, activeFileId, {
+      await streamChat(message, targetConversationId, activeFileId, selectedIdsForRequest, {
         onMeta: (payload) => {
           if (typeof payload.conversation_id === "string") {
             setConversationId((current) => current || payload.conversation_id as string);
@@ -1219,6 +1246,36 @@ function App() {
     setPreviewOpen(true);
   }
 
+  function renderFileRow(file: UploadedFile) {
+    const testSource = isTestSource(file);
+    return (
+      <div className={`file-row ${file.id === activeFileId ? "selected" : ""} ${testSource ? "test-source" : ""}`} key={file.id}>
+        <input
+          aria-label={file.original_name}
+          checked={selectedFileIds.includes(file.id)}
+          onChange={() => toggleFileSelection(file.id)}
+          type="checkbox"
+        />
+        <button className="list-item" onClick={() => setActiveFileId(file.id)}>
+          <strong>{javaDisplayName(file)}</strong>
+          <span className="file-meta">
+            <span>{file.analysis.class_name || "Unknown"} - {file.analysis.method_count || 0} {text.methods}</span>
+            <span className={`source-tag ${testSource ? "test" : "prod"}`}>{testSource ? text.testSources : text.prodSources}</span>
+          </span>
+        </button>
+        <button
+          className="mini-icon-btn"
+          type="button"
+          title={testSource ? "这是测试源码，不生成 TestTest" : "为这个 Java 文件生成测试"}
+          onClick={() => generateForFiles([file.id], `为 ${file.original_name} 生成测试`, false)}
+          disabled={busy || testSource}
+        >
+          <Bot size={15} />
+        </button>
+      </div>
+    );
+  }
+
   if (!authed) return <AuthGate onAuthed={() => setAuthed(true)} />;
 
   return (
@@ -1318,11 +1375,11 @@ function App() {
               <RefreshCw size={17} />
               {text.inspect}
             </button>
-            <button type="button" onClick={() => submitChat(undefined, suggestions[0])} disabled={!activeFileId || busy || chatBusy}>
+            <button type="button" onClick={() => submitChat(undefined, suggestions[0])} disabled={!activeFileId || chatBusy}>
               <Bot size={17} />
               {text.generate}
             </button>
-            <button type="button" onClick={() => submitChat(undefined, suggestions[4])} disabled={!activeFileId || busy || chatBusy}>
+            <button type="button" onClick={() => submitChat(undefined, suggestions[4])} disabled={!activeFileId || chatBusy}>
               <BarChart3 size={17} />
               {text.coverage}
             </button>
@@ -1377,7 +1434,7 @@ function App() {
                       <Square size={16} />
                     </button>
                   )}
-                  <button className="send-btn" disabled={busy || chatBusy} type="submit">
+                  <button className="send-btn" disabled={chatBusy || !input.trim()} type="submit">
                     <Send size={18} />
                   </button>
                 </div>
@@ -1439,74 +1496,67 @@ function App() {
                 <button type="button" title={text.deleteSelectedFiles} onClick={deleteSelectedFiles} disabled={!selectedFileIds.length || busy}>
                   删除已选
                 </button>
-                <button
-                  type="button"
-                  title="为已选或全部未生成测试的生产源码生成测试"
-                  onClick={batchGenerateMissingTests}
-                  disabled={busy || (!selectedFileIds.length && !availableGenerationFiles.length)}
-                >
-                  {text.batchGenerateMissing}
-                </button>
+                <div className="toolbar-action-with-help">
+                  <button
+                    type="button"
+                    title={text.batchGenerateHelp}
+                    onClick={batchGenerateMissingTests}
+                    disabled={busy || (!selectedFileIds.length && !availableGenerationFiles.length)}
+                  >
+                    {text.batchGenerateMissing}
+                  </button>
+                  <span className="help-tooltip" tabIndex={0} aria-label={text.batchGenerateHelp}>
+                    <HelpCircle size={15} />
+                    <span className="tooltip-panel">{text.batchGenerateHelp}</span>
+                  </span>
+                </div>
               </div>
               <div className="scroll-list files-list">
-                {fileGroups.map((group) => (
-                  <div className="project-group" key={group.id}>
-                    <div className="project-header">
-                      <div>
-                        <strong>{group.name}</strong>
-                        <span>{generationTargets(group.files).length} 个可生成 / {group.files.length} 个 Java{group.buildTool ? ` · ${group.buildTool}` : ""}</span>
-                      </div>
-                      {group.id !== "loose" && (
-                        <div className="project-actions">
-                          <button
-                            className="project-action-btn"
-                            type="button"
-                            title="提取当前项目上下文"
-                            onClick={() => extractContextForFiles(group.files.map((file) => file.id), `提取项目 ${group.name} 上下文`)}
-                            disabled={busy}
-                          >
-                            上下文
-                          </button>
-                          <button
-                            className="project-action-btn"
-                            type="button"
-                            title="生成当前项目未测测试"
-                            onClick={() => generateForFiles(generationTargets(group.files).map((file) => file.id), `为项目 ${group.name} 生成未测测试`, true)}
-                            disabled={busy || !generationTargets(group.files).length}
-                          >
-                            生成
-                          </button>
+                {fileGroups.map((group) => {
+                  const prodFiles = generationTargets(group.files);
+                  const testFiles = group.files.filter((file) => isTestSource(file));
+                  return (
+                    <div className="project-group" key={group.id}>
+                      <div className="project-header">
+                        <div>
+                          <strong>{group.name}</strong>
+                          <span>{prodFiles.length} 个可生成 / {group.files.length} 个 Java{group.buildTool ? ` · ${group.buildTool}` : ""}</span>
                         </div>
-                      )}
-                    </div>
-                    {group.files.map((file) => (
-                      <div className={`file-row ${file.id === activeFileId ? "selected" : ""} ${isTestSource(file) ? "test-source" : ""}`} key={file.id}>
-                        <input
-                          aria-label={file.original_name}
-                          checked={selectedFileIds.includes(file.id)}
-                          onChange={() => toggleFileSelection(file.id)}
-                          type="checkbox"
-                        />
-                        <button className="list-item" onClick={() => setActiveFileId(file.id)}>
-                          <strong>{javaDisplayName(file)}</strong>
-                          <span className="file-meta">
-                            <span>{file.analysis.class_name || "Unknown"} - {file.analysis.method_count || 0} {text.methods}</span>
-                            <span className={`source-tag ${isTestSource(file) ? "test" : "prod"}`}>{isTestSource(file) ? "测试源码" : "生产源码"}</span>
-                          </span>
-                        </button>
-                        <button
-                          className="mini-icon-btn"
-                          type="button"
-                          title={isTestSource(file) ? "这是测试源码，不生成 TestTest" : "为这个 Java 文件生成测试"}
-                          onClick={() => generateForFiles([file.id], `为 ${file.original_name} 生成测试`, false)}
-                          disabled={busy || isTestSource(file)}
-                        >
-                          <Bot size={15} />
-                        </button>
+                        {group.id !== "loose" && (
+                          <div className="project-actions">
+                            <button
+                              className="project-action-btn"
+                              type="button"
+                              title="提取当前项目上下文"
+                              onClick={() => extractContextForFiles(group.files.map((file) => file.id), `提取项目 ${group.name} 上下文`)}
+                              disabled={busy}
+                            >
+                              上下文
+                            </button>
+                            <button
+                              className="project-action-btn"
+                              type="button"
+                              title="生成当前项目未测测试"
+                              onClick={() => generateForFiles(prodFiles.map((file) => file.id), `为项目 ${group.name} 生成未测测试`, true)}
+                              disabled={busy || !prodFiles.length}
+                            >
+                              生成
+                            </button>
+                          </div>
+                        )}
                       </div>
-                    ))}
-                  </div>
-                ))}
+                      <div className="file-subsection">
+                        <div className="file-subsection-title">{text.prodSources}<span>{prodFiles.length}</span></div>
+                        {prodFiles.length ? prodFiles.map(renderFileRow) : <p className="empty-inline">{text.noProdSources}</p>}
+                      </div>
+                      <div className="file-subsection">
+                        <div className="file-subsection-title">{text.testSources}<span>{testFiles.length}</span></div>
+                        {testFiles.length ? testFiles.map(renderFileRow) : <p className="empty-inline">{text.noTestSources}</p>}
+                      </div>
+                    </div>
+                  );
+                })}
+                {!fileGroups.length && <p className="empty-inline">暂无 Java 文件</p>}
               </div>
             </section>
 

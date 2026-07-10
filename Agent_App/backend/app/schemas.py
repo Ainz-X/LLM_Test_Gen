@@ -59,6 +59,7 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = None
     message: str
     active_file_id: str | None = None
+    selected_file_ids: list[str] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):

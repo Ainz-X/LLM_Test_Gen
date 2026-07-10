@@ -237,7 +237,7 @@ textarea:focus {
 }
 
 .files-list {
-  max-height: 155px;
+  max-height: min(360px, calc(100vh - 390px));
 }
 
 .artifact-list {
@@ -841,6 +841,14 @@ details code,
   gap: 7px;
 }
 
+.toolbar-action-with-help {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  align-items: stretch;
+  gap: 5px;
+  min-width: 0;
+}
+
 .file-toolbar button {
   display: inline-flex;
   align-items: center;
@@ -854,6 +862,67 @@ details code,
   color: var(--text);
   padding: 0 8px;
   overflow-wrap: anywhere;
+}
+
+.help-tooltip {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  outline: none;
+}
+
+.tooltip-panel {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 8px);
+  right: 0;
+  display: none;
+  width: min(260px, 70vw);
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #111827;
+  color: white;
+  box-shadow: var(--shadow);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.help-tooltip:hover .tooltip-panel,
+.help-tooltip:focus .tooltip-panel {
+  display: block;
+}
+
+.file-subsection {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.file-subsection-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #475467;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.file-subsection-title span {
+  color: var(--muted);
+  font-weight: 650;
+}
+
+.empty-inline {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .compact-actions {

@@ -187,6 +187,7 @@ export async function streamChat(
   message: string,
   conversationId: string | undefined,
   activeFileId: string | undefined,
+  selectedFileIds: string[] | undefined,
   handlers: StreamHandlers,
   signal?: AbortSignal
 ) {
@@ -197,7 +198,12 @@ export async function streamChat(
       "Content-Type": "application/json",
       Authorization: `Bearer ${token()}`
     },
-    body: JSON.stringify({ message, conversation_id: conversationId, active_file_id: activeFileId })
+    body: JSON.stringify({
+      message,
+      conversation_id: conversationId,
+      active_file_id: activeFileId,
+      selected_file_ids: selectedFileIds || []
+    })
   });
   if (!response.ok || !response.body) throw new Error(await response.text());
   const reader = response.body.getReader();

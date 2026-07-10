@@ -6,6 +6,7 @@ import re
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response, StreamingResponse
+from sqlalchemy import case
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -98,7 +99,11 @@ def export_conversation(
     messages = (
         db.query(Message)
         .filter(Message.conversation_id == conversation_id)
-        .order_by(Message.created_at.asc(), Message.id.asc())
+        .order_by(
+            Message.created_at.asc(),
+            case((Message.role == "user", 0), (Message.role == "assistant", 1), else_=2).asc(),
+            Message.id.asc(),
+        )
         .all()
     )
     export_format = format.lower()
@@ -156,7 +161,11 @@ def list_messages(conversation_id: str, db: Session = Depends(get_db), user: Use
     return (
         db.query(Message)
         .filter(Message.conversation_id == conversation_id)
-        .order_by(Message.created_at.asc(), Message.id.asc())
+        .order_by(
+            Message.created_at.asc(),
+            case((Message.role == "user", 0), (Message.role == "assistant", 1), else_=2).asc(),
+            Message.id.asc(),
+        )
         .all()
     )
 
@@ -184,7 +193,13 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db), user: User = Depen
         if message.role in {"user", "assistant"} and message.id != user_message.id
     ]
     service = AgentService(db, user)
-    reply, tool_results = service.llm_chat(conversation.id, payload.message, payload.active_file_id or conversation.active_file_id, history)
+    reply, tool_results = service.llm_chat(
+        conversation.id,
+        payload.message,
+        payload.active_file_id or conversation.active_file_id,
+        history,
+        payload.selected_file_ids,
+    )
     assistant_message = Message(
         conversation_id=conversation.id,
         role="assistant",
@@ -227,7 +242,13 @@ def chat_stream(payload: ChatRequest, db: Session = Depends(get_db), user: User 
         service = AgentService(db, user)
         reply_parts: list[str] = []
         tool_results: list[dict] = []
-        for event in service.llm_chat_events(conversation.id, payload.message, payload.active_file_id or conversation.active_file_id, history):
+        for event in service.llm_chat_events(
+            conversation.id,
+            payload.message,
+            payload.active_file_id or conversation.active_file_id,
+            history,
+            payload.selected_file_ids,
+        ):
             if event.get("event") == "tool":
                 result = event["data"]
                 tool_results.append(result)
