@@ -27,6 +27,14 @@ from app.services.storage_service import put_object
 
 
 JACOCO_VERSION = "0.8.12"
+JACOCO_COUNTERS = (
+    ("instruction", "INSTRUCTION"),
+    ("branch", "BRANCH"),
+    ("complexity", "COMPLEXITY"),
+    ("line", "LINE"),
+    ("method", "METHOD"),
+    ("class_counter", "CLASS"),
+)
 
 
 class GenerationCancelled(Exception):
@@ -73,12 +81,28 @@ def tool_call_key(name: str, args: dict[str, Any]) -> str:
     return f"{name}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
 
 
+def compact_coverage_report(coverage: Any) -> Any:
+    if not isinstance(coverage, dict):
+        return coverage
+    classes = coverage.get("classes")
+    return {
+        "ok": coverage.get("ok"),
+        "target_class": coverage.get("target_class"),
+        "target": coverage.get("target"),
+        "total": coverage.get("total"),
+        "classes": classes[:8] if isinstance(classes, list) else [],
+        "class_count": coverage.get("class_count"),
+    }
+
+
 def compact_tool_result(result: dict[str, Any], max_chars: int = 5000) -> dict[str, Any]:
     compact = dict(result)
     if "code" in compact:
         code = str(compact.pop("code"))
         compact["code_preview"] = truncate(code, 1200)
         compact["code_chars"] = len(code)
+    if compact.get("tool") == "run_coverage" and "coverage" in compact:
+        compact["coverage"] = compact_coverage_report(compact.get("coverage"))
     if "prompt" in compact:
         compact.pop("prompt", None)
     if "output" in compact:
@@ -86,12 +110,15 @@ def compact_tool_result(result: dict[str, Any], max_chars: int = 5000) -> dict[s
     text = json.dumps(compact, ensure_ascii=False, default=str)
     if len(text) <= max_chars:
         return compact
-    return {
+    truncated = {
         "ok": compact.get("ok", True),
         "tool": compact.get("tool", "unknown"),
         "truncated": True,
         "summary": truncate(text, max_chars),
     }
+    if compact.get("coverage") is not None:
+        truncated["coverage"] = compact.get("coverage")
+    return truncated
 
 
 def _legacy_normalize_user_request_v1(message: str, file_id: str | None) -> dict[str, Any]:
@@ -322,6 +349,35 @@ def concise_failure_reason(result: dict[str, Any]) -> str:
     if stage:
         return f"在 `{stage}` 阶段失败，请查看工具输出中的编译/运行日志。"
     return "执行失败，请查看工具输出。"
+
+
+def coverage_percent_text(metric: Any) -> str:
+    if not isinstance(metric, dict):
+        return "N/A"
+    percent = metric.get("percent")
+    if percent is None:
+        return "N/A"
+    return f"{percent}%"
+
+
+def coverage_summary_text(coverage: Any) -> str:
+    if not isinstance(coverage, dict):
+        return "已完成 JaCoCo 覆盖率，但未能解析结构化覆盖率数据。"
+    target = coverage.get("target") if isinstance(coverage.get("target"), dict) else None
+    if not target:
+        target_class = coverage.get("target_class") or "当前类"
+        return f"已完成 JaCoCo 覆盖率，但报告中未匹配到 `{target_class}` 的目标类行。"
+    class_name = target.get("class") or coverage.get("target_class") or "目标类"
+    parts = [
+        ("指令", "instruction"),
+        ("分支", "branch"),
+        ("复杂度", "complexity"),
+        ("行", "line"),
+        ("方法", "method"),
+        ("类", "class_counter"),
+    ]
+    metrics = "，".join(f"{label} {coverage_percent_text(target.get(key))}" for label, key in parts)
+    return f"已完成 JaCoCo 覆盖率。`{class_name}`：{metrics}。"
 
 
 def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
@@ -1731,10 +1787,7 @@ class AgentService:
                 coverage_result = self.tool_run_coverage({"artifact_id": latest.id})
                 results.append(coverage_result)
                 if coverage_result.get("ok"):
-                    target = (coverage_result.get("coverage") or {}).get("target") or {}
-                    line = ((target.get("line") or {}).get("percent"))
-                    line_text = f"{line}%" if line is not None else "未识别"
-                    reply = f"已运行 JaCoCo 覆盖率。目标类行覆盖率：{line_text}。"
+                    reply = coverage_summary_text(coverage_result.get("coverage"))
                 else:
                     reply = "覆盖率没有跑成：" + concise_failure_reason(coverage_result)
         elif file_id and normalized["intent"] == "_legacy_run_coverage":
@@ -1745,9 +1798,7 @@ class AgentService:
             else:
                 results.append(self.tool_run_coverage({"artifact_id": latest.id}))
                 if results[-1].get("ok"):
-                    target = (results[-1].get("coverage") or {}).get("target") or {}
-                    line = ((target.get("line") or {}).get("percent"))
-                    reply = f"已运行 JaCoCo 覆盖率。目标类行覆盖率：{line if line is not None else '未识别'}%。"
+                    reply = coverage_summary_text(results[-1].get("coverage"))
                 else:
                     reply = "覆盖率执行失败：" + str(results[-1].get("reason") or results[-1].get("output") or results[-1].get("stage"))
         elif file_id and normalized["intent"] == "repair_latest":
@@ -1936,10 +1987,7 @@ class AgentService:
         self.record_tool(conversation_id, "run_coverage", {"artifact_id": latest.id}, compact)
         yield {"event": "tool", "data": compact}
         if result.get("ok"):
-            target = (result.get("coverage") or {}).get("target") or {}
-            line = ((target.get("line") or {}).get("percent"))
-            line_text = f"{line}%" if line is not None else "未识别"
-            reply = f"已完成 JaCoCo 覆盖率。目标类行覆盖率：{line_text}。"
+            reply = coverage_summary_text(result.get("coverage"))
         else:
             reply = "覆盖率没有跑成：" + concise_failure_reason(compact)
         for index in range(0, len(reply), 18):
@@ -2666,14 +2714,25 @@ class AgentService:
             percent = round((covered / total) * 100, 2) if total else None
             return {"missed": missed, "covered": covered, "total": total, "percent": percent}
 
+        def aggregate(items: list[dict[str, Any]]) -> dict[str, Any]:
+            totals: dict[str, Any] = {}
+            for key, _prefix in JACOCO_COUNTERS:
+                missed = sum(int((item.get(key) or {}).get("missed") or 0) for item in items)
+                covered = sum(int((item.get(key) or {}).get("covered") or 0) for item in items)
+                total = missed + covered
+                totals[key] = {
+                    "missed": missed,
+                    "covered": covered,
+                    "total": total,
+                    "percent": round((covered / total) * 100, 2) if total else None,
+                }
+            return totals
+
         classes = [
             {
                 "package": row.get("PACKAGE", ""),
                 "class": row.get("CLASS", ""),
-                "instruction": metric(row, "INSTRUCTION"),
-                "branch": metric(row, "BRANCH"),
-                "line": metric(row, "LINE"),
-                "method": metric(row, "METHOD"),
+                **{key: metric(row, prefix) for key, prefix in JACOCO_COUNTERS},
             }
             for row in rows
         ]
@@ -2682,6 +2741,8 @@ class AgentService:
             "ok": True,
             "target_class": target_class,
             "target": target_rows[0] if target_rows else None,
+            "total": aggregate(classes),
+            "class_count": len(classes),
             "classes": classes[:20],
         }
 

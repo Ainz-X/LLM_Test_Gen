@@ -157,6 +157,152 @@ const emptyTask: TaskModalState = {
   rejected: []
 };
 
+type CoverageMetric = {
+  missed?: number;
+  covered?: number;
+  total?: number;
+  percent?: number | null;
+};
+
+type CoverageRow = {
+  package?: string;
+  class?: string;
+  instruction?: CoverageMetric;
+  branch?: CoverageMetric;
+  complexity?: CoverageMetric;
+  line?: CoverageMetric;
+  method?: CoverageMetric;
+  class_counter?: CoverageMetric;
+};
+
+type CoverageReport = {
+  ok?: boolean;
+  target_class?: string;
+  target?: CoverageRow | null;
+  total?: Record<string, CoverageMetric>;
+  classes?: CoverageRow[];
+  class_count?: number;
+};
+
+const coverageCounters: Array<{ key: keyof CoverageRow; label: string; short: string }> = [
+  { key: "instruction", label: "Instructions", short: "指令" },
+  { key: "branch", label: "Branches", short: "分支" },
+  { key: "complexity", label: "Complexity", short: "复杂度" },
+  { key: "line", label: "Lines", short: "行" },
+  { key: "method", label: "Methods", short: "方法" },
+  { key: "class_counter", label: "Classes", short: "类" }
+];
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function asCoverageReport(value: unknown): CoverageReport | undefined {
+  const record = asRecord(value);
+  if (!record) return undefined;
+  return record as CoverageReport;
+}
+
+function coverageFromToolResult(item: unknown): CoverageReport | undefined {
+  const record = asRecord(item);
+  if (!record || record.tool !== "run_coverage") return undefined;
+  const direct = asCoverageReport(record.coverage);
+  if (direct) return direct;
+  if (typeof record.summary === "string") {
+    try {
+      return asCoverageReport(JSON.parse(record.summary).coverage);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function coverageReports(items?: unknown[]) {
+  return (items || []).map(coverageFromToolResult).filter(Boolean) as CoverageReport[];
+}
+
+function metricLabel(metric?: CoverageMetric) {
+  if (!metric || metric.percent == null) return "N/A";
+  return `${metric.percent}%`;
+}
+
+function metricCounts(metric?: CoverageMetric) {
+  if (!metric || metric.total == null) return "0 / 0";
+  return `${metric.covered ?? 0} / ${metric.total}`;
+}
+
+function CoverageBar({ label, metric }: { label: string; metric?: CoverageMetric }) {
+  const coveredPercent = typeof metric?.percent === "number" ? Math.max(0, Math.min(100, metric.percent)) : 0;
+  const missedPercent = metric?.total ? 100 - coveredPercent : 0;
+  return (
+    <div className="coverage-metric">
+      <div className="coverage-metric-head">
+        <span>{label}</span>
+        <strong>{metricLabel(metric)}</strong>
+      </div>
+      <div className={`coverage-bar ${metric?.total ? "" : "empty"}`} aria-label={`${label} ${metricLabel(metric)}`}>
+        <span className="missed" style={{ width: `${missedPercent}%` }} />
+        <span className="covered" style={{ width: `${coveredPercent}%` }} />
+      </div>
+      <div className="coverage-metric-foot">
+        <span>covered</span>
+        <span>{metricCounts(metric)}</span>
+      </div>
+    </div>
+  );
+}
+
+function CoverageReportCard({ report }: { report: CoverageReport }) {
+  const target = report.target || undefined;
+  const total = report.total || undefined;
+  const classRows = (report.classes || []).slice(0, 6);
+  const targetName = target?.class || report.target_class || "目标类";
+  return (
+    <section className="coverage-card">
+      <div className="coverage-card-head">
+        <div>
+          <strong>JaCoCo Coverage</strong>
+          <span>{targetName}</span>
+        </div>
+        {typeof report.class_count === "number" && <span>{report.class_count} classes</span>}
+      </div>
+
+      <div className="coverage-block">
+        <div className="coverage-block-title">目标类</div>
+        <div className="coverage-grid">
+          {coverageCounters.map((counter) => (
+            <CoverageBar key={String(counter.key)} label={counter.label} metric={target?.[counter.key] as CoverageMetric | undefined} />
+          ))}
+        </div>
+      </div>
+
+      {total && (
+        <div className="coverage-block">
+          <div className="coverage-block-title">本次报告总计</div>
+          <div className="coverage-grid compact">
+            {coverageCounters.map((counter) => (
+              <CoverageBar key={String(counter.key)} label={counter.short} metric={total[counter.key as string]} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {classRows.length > 0 && (
+        <div className="coverage-class-list">
+          <div className="coverage-block-title">类列表预览</div>
+          {classRows.map((row, index) => (
+            <div className="coverage-class-row" key={`${row.package || ""}.${row.class || index}`}>
+              <span title={`${row.package || ""}.${row.class || ""}`}>{row.class || "Unknown"}</span>
+              <CoverageBar label="Lines" metric={row.line} />
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function AuthGate({ onAuthed }: { onAuthed: () => void }) {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
@@ -1075,6 +1221,9 @@ function App() {
                   <div className="avatar">{message.role === "user" ? "U" : "A"}</div>
                   <div className="message-body">
                     <pre>{message.content || (message.role === "assistant" && busy ? status || "Thinking" : "")}</pre>
+                    {coverageReports(message.tool_results?.items).map((report, index) => (
+                      <CoverageReportCard key={`${message.id}-coverage-${index}`} report={report} />
+                    ))}
                     {message.tool_results?.items?.length ? (
                       <details>
                         <summary>{message.tool_results.items.length} {text.toolResults}</summary>

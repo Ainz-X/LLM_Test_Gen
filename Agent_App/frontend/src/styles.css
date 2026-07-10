@@ -517,6 +517,127 @@ details code,
   font-size: 12px;
 }
 
+.coverage-card {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.coverage-card-head,
+.coverage-metric-head,
+.coverage-metric-foot,
+.coverage-class-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.coverage-card-head > div {
+  display: grid;
+  min-width: 0;
+}
+
+.coverage-card-head strong {
+  font-size: 14px;
+}
+
+.coverage-card-head span,
+.coverage-metric-foot,
+.coverage-block-title {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.coverage-card-head span {
+  overflow-wrap: anywhere;
+}
+
+.coverage-block {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.coverage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 9px;
+}
+
+.coverage-grid.compact {
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+}
+
+.coverage-metric {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.coverage-metric-head span,
+.coverage-class-row > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.coverage-metric-head strong {
+  font-size: 12px;
+}
+
+.coverage-bar {
+  display: flex;
+  width: 100%;
+  height: 10px;
+  overflow: hidden;
+  border: 1px solid #cfd6e2;
+  border-radius: 999px;
+  background: #eef2f7;
+}
+
+.coverage-bar span {
+  display: block;
+  min-width: 0;
+  height: 100%;
+}
+
+.coverage-bar .missed {
+  background: #d64545;
+}
+
+.coverage-bar .covered {
+  background: #15915f;
+}
+
+.coverage-bar.empty {
+  background: repeating-linear-gradient(135deg, #eef2f7 0, #eef2f7 6px, #dde3ec 6px, #dde3ec 12px);
+}
+
+.coverage-class-list {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.coverage-class-row {
+  display: grid;
+  grid-template-columns: minmax(0, 210px) minmax(0, 1fr);
+  padding-top: 7px;
+  border-top: 1px solid #edf1f6;
+}
+
+.coverage-class-row > span {
+  font-size: 12px;
+  font-weight: 650;
+}
+
 .code-preview {
   max-height: 280px;
 }
