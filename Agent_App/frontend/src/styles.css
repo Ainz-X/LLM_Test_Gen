@@ -167,8 +167,8 @@ textarea:focus {
 }
 
 .sidebar {
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   gap: 14px;
   min-height: 0;
   padding: 16px;
@@ -217,6 +217,7 @@ textarea:focus {
   align-content: start;
   gap: 8px;
   min-height: 0;
+  max-height: calc(100vh - 170px);
   overflow: auto;
   padding-right: 2px;
 }
@@ -265,6 +266,63 @@ textarea:focus {
 
 .conversation-row {
   grid-template-columns: minmax(0, 1fr) 34px;
+  position: relative;
+}
+
+.conversation-menu-wrap {
+  position: relative;
+  min-width: 0;
+}
+
+.conversation-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 6px);
+  right: 0;
+  display: grid;
+  width: 190px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.conversation-menu button {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  padding: 0 9px;
+  text-align: left;
+}
+
+.conversation-menu button:hover {
+  background: #eef2f7;
+}
+
+.conversation-menu .danger-menu-item {
+  color: var(--red);
+}
+
+.running-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.empty-history {
+  margin: 8px 0;
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .file-row {

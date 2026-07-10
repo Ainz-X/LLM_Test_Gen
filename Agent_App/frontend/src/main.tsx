@@ -9,7 +9,9 @@ import {
   FileCode2,
   History,
   LogOut,
+  MoreVertical,
   PackageOpen,
+  Pencil,
   Plus,
   RefreshCw,
   Send,
@@ -35,6 +37,7 @@ import {
   deleteUploadedFiles,
   downloadArtifact,
   downloadArtifactsZip,
+  exportConversation,
   extractCodeContext,
   getArtifacts,
   getConversations,
@@ -46,6 +49,7 @@ import {
   rateMessage,
   readArtifact,
   register,
+  renameConversation,
   streamGenerateTestsBatch,
   streamJob,
   streamChat,
@@ -84,6 +88,11 @@ const text = {
   selectAll: "\u5168\u9009",
   batchGenerateMissing: "\u751f\u6210\u672a\u6d4b",
   deleteConversation: "\u5220\u9664\u5bf9\u8bdd",
+  renameConversation: "重命名",
+  exportConversation: "导出对话",
+  exportMarkdown: "导出 Markdown",
+  exportJson: "导出 JSON",
+  conversationName: "对话名称",
   methods: "\u4e2a\u65b9\u6cd5",
   artifacts: "\u751f\u6210\u4ea7\u7269",
   zipCurrent: "\u6253\u5305\u5f53\u524d",
@@ -120,6 +129,11 @@ type TaskModalState = {
   files: UploadedFile[];
   rejected: Array<{ name: string; reason: string }>;
   result?: BatchGenerateResult & { context_rows?: number; file_count?: number; groups?: unknown[] };
+};
+
+type ChatRunState = {
+  status: string;
+  assistantId: string;
 };
 
 type FileGroup = {
@@ -363,7 +377,8 @@ function App() {
   const [authed, setAuthed] = useState(Boolean(localStorage.getItem("a3_agent_token")));
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationId, setConversationId] = useState<string | undefined>();
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messagesByConversation, setMessagesByConversation] = useState<Record<string, Message[]>>({});
+  const [chatRuns, setChatRuns] = useState<Record<string, ChatRunState>>({});
   const [files, setFiles] = useState<UploadedFile[]>([]);
   const [activeFileId, setActiveFileId] = useState<string | undefined>();
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -380,12 +395,16 @@ function App() {
   const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [taskModal, setTaskModal] = useState<TaskModalState>(emptyTask);
+  const [openConversationMenuId, setOpenConversationMenuId] = useState<string | undefined>();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
-  const chatAbortRef = useRef<AbortController | null>(null);
+  const chatAbortRefs = useRef<Record<string, AbortController>>({});
   const batchAbortRef = useRef<{ controller: AbortController; jobId: string } | null>(null);
   const contextAbortRef = useRef<{ controller: AbortController; jobId: string } | null>(null);
 
   const activeFile = useMemo(() => files.find((file) => file.id === activeFileId), [files, activeFileId]);
+  const messages = conversationId ? messagesByConversation[conversationId] || [] : [];
+  const activeChatRun = conversationId ? chatRuns[conversationId] : undefined;
+  const chatBusy = Boolean(activeChatRun);
   const fileGroups = useMemo<FileGroup[]>(() => {
     const groups = new Map<string, FileGroup>();
     for (const file of files) {
@@ -413,6 +432,14 @@ function App() {
     ...current.filter((file) => !incoming.some((next) => next.id === file.id))
   ];
 
+  function setConversationMessages(id: string, updater: Message[] | ((current: Message[]) => Message[])) {
+    setMessagesByConversation((current) => {
+      const existing = current[id] || [];
+      const next = typeof updater === "function" ? updater(existing) : updater;
+      return { ...current, [id]: next };
+    });
+  }
+
   async function refresh() {
     const [conversationRows, fileRows] = await Promise.all([getConversations(), getFiles()]);
     setConversations(conversationRows);
@@ -427,12 +454,15 @@ function App() {
 
   useEffect(() => {
     if (!conversationId) {
-      setMessages([]);
       return;
     }
-    if (busy) return;
-    getMessages(conversationId).then(setMessages).catch(console.error);
-  }, [conversationId, busy]);
+    if (chatRuns[conversationId] && messagesByConversation[conversationId]?.length) {
+      return;
+    }
+    getMessages(conversationId)
+      .then((rows) => setConversationMessages(conversationId, rows))
+      .catch(console.error);
+  }, [conversationId]);
 
   useEffect(() => {
     if (!activeFileId) {
@@ -460,7 +490,7 @@ function App() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages, status]);
+  }, [messages, activeChatRun?.status]);
 
   useEffect(() => {
     if (!taskModal.open || !taskModal.running || !taskModal.indeterminate) return;
@@ -490,26 +520,47 @@ function App() {
   }, [suggestionIndex]);
 
   async function startNewConversation() {
-    const conversation = await createConversation(text.newChat);
+    const title = window.prompt(text.conversationName, text.newChat)?.trim() || text.newChat;
+    const conversation = await createConversation(title);
     setConversationId(conversation.id);
-    setMessages([]);
+    setConversationMessages(conversation.id, []);
     await refresh();
   }
 
   async function removeConversation(id: string) {
-    if (busy) return;
-    setBusy(true);
-    try {
-      await deleteConversation(id);
-      const nextConversations = await getConversations();
-      setConversations(nextConversations);
-      if (conversationId === id) {
-        setConversationId(nextConversations[0]?.id);
-        if (!nextConversations[0]) setMessages([]);
-      }
-    } finally {
-      setBusy(false);
+    if (!window.confirm("确定删除这个对话吗？")) return;
+    chatAbortRefs.current[id]?.abort();
+    delete chatAbortRefs.current[id];
+    setChatRuns((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+    await deleteConversation(id);
+    const nextConversations = await getConversations();
+    setConversations(nextConversations);
+    setMessagesByConversation((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+    if (conversationId === id) {
+      setConversationId(nextConversations[0]?.id);
     }
+    setOpenConversationMenuId(undefined);
+  }
+
+  async function renameConversationInline(conversation: Conversation) {
+    const nextTitle = window.prompt(text.conversationName, conversation.title)?.trim();
+    if (!nextTitle || nextTitle === conversation.title) return;
+    const updated = await renameConversation(conversation.id, nextTitle);
+    setConversations((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+    setOpenConversationMenuId(undefined);
+  }
+
+  async function exportConversationInline(conversation: Conversation, format: "markdown" | "json") {
+    await exportConversation(conversation, format);
+    setOpenConversationMenuId(undefined);
   }
 
   function toggleFileSelection(fileId: string) {
@@ -714,18 +765,20 @@ function App() {
         currentItem: "",
         result: displayResult
       }));
-      setMessages((current) => [
-        ...current,
-        {
-          id: `local-batch-${Date.now()}`,
-          role: "assistant",
-          content: result.cancelled
-            ? `批量生成已中断：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个。`
-            : `已完成批量生成：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个。`,
-          tool_results: { items: [displayResult] },
-          created_at: new Date().toISOString()
-        }
-      ]);
+      if (conversationId) {
+        setConversationMessages(conversationId, (current) => [
+          ...current,
+          {
+            id: `local-batch-${Date.now()}`,
+            role: "assistant",
+            content: result.cancelled
+              ? `批量生成已中断：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个。`
+              : `已完成批量生成：生成 ${generated} 个，跳过 ${skipped} 个，失败 ${failed} 个。`,
+            tool_results: { items: [displayResult] },
+            created_at: new Date().toISOString()
+          }
+        ]);
+      }
       await Promise.all([refresh(), activeFileId ? getArtifacts(activeFileId).then(setArtifacts) : Promise.resolve()]);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
@@ -836,19 +889,21 @@ function App() {
       }
       const result = finalJob?.result_json || {};
       const rows = Number(result.context_rows || 0);
-      setMessages((current) => [
-        ...current,
-        {
-          id: `local-context-${Date.now()}`,
-          role: "assistant",
-          content:
-            finalJob?.status === "succeeded"
-              ? `上下文提取完成：处理 ${result.file_count || fileIds.length} 个 Java 文件，写入/复用 ${rows} 行方法级上下文。现在可以问我当前代码的 Jimple Code、FQN、Method Source 等。`
-              : `上下文提取结束：${finalJob?.message || "任务未成功完成"}`,
-          tool_results: { items: [finalJob || job] },
-          created_at: new Date().toISOString()
-        }
-      ]);
+      if (conversationId) {
+        setConversationMessages(conversationId, (current) => [
+          ...current,
+          {
+            id: `local-context-${Date.now()}`,
+            role: "assistant",
+            content:
+              finalJob?.status === "succeeded"
+                ? `上下文提取完成：处理 ${result.file_count || fileIds.length} 个 Java 文件，写入/复用 ${rows} 行方法级上下文。现在可以问我当前代码的 Jimple Code、FQN、Method Source 等。`
+                : `上下文提取结束：${finalJob?.message || "任务未成功完成"}`,
+            tool_results: { items: [finalJob || job] },
+            created_at: new Date().toISOString()
+          }
+        ]);
+      }
       await refresh();
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
@@ -959,9 +1014,16 @@ function App() {
     event?.preventDefault();
     const message = (preset ?? input).trim();
     if (!message || busy) return;
+    let targetConversationId = conversationId;
+    if (!targetConversationId) {
+      const created = await createConversation(message.slice(0, 80) || text.newChat);
+      targetConversationId = created.id;
+      setConversationId(created.id);
+      setConversations((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+      setConversationMessages(created.id, []);
+    }
+    if (chatRuns[targetConversationId]) return;
     setInput("");
-    setBusy(true);
-    setStatus("Thinking");
     const userMessage: Message = {
       id: `local-user-${Date.now()}`,
       role: "user",
@@ -976,17 +1038,28 @@ function App() {
       tool_results: { items: [] },
       created_at: new Date().toISOString()
     };
-    setMessages((current) => [...current, userMessage, assistantMessage]);
+    setConversationMessages(targetConversationId, (current) => [...current, userMessage, assistantMessage]);
+    setChatRuns((current) => ({ ...current, [targetConversationId]: { status: "Thinking", assistantId } }));
     try {
       const controller = new AbortController();
-      chatAbortRef.current = controller;
-      await streamChat(message, conversationId, activeFileId, {
+      chatAbortRefs.current[targetConversationId] = controller;
+      await streamChat(message, targetConversationId, activeFileId, {
         onMeta: (payload) => {
-          if (typeof payload.conversation_id === "string") setConversationId(payload.conversation_id);
+          if (typeof payload.conversation_id === "string") {
+            setConversationId((current) => current || payload.conversation_id as string);
+          }
         },
-        onStatus: (payload) => setStatus(String(payload.message || "")),
+        onStatus: (payload) => {
+          setChatRuns((current) => ({
+            ...current,
+            [targetConversationId]: {
+              ...(current[targetConversationId] || { assistantId }),
+              status: String(payload.message || "Thinking")
+            }
+          }));
+        },
         onTool: (payload) => {
-          setMessages((current) =>
+          setConversationMessages(targetConversationId, (current) =>
             current.map((item) =>
               item.id === assistantId
                 ? { ...item, tool_results: { items: [...(item.tool_results?.items || []), payload] } }
@@ -996,22 +1069,22 @@ function App() {
           trackContextJobFromTool(payload).catch(console.error);
         },
         onDelta: (chunk) => {
-          setMessages((current) =>
+          setConversationMessages(targetConversationId, (current) =>
             current.map((item) => (item.id === assistantId ? { ...item, content: item.content + chunk } : item))
           );
         },
         onDone: async (payload) => {
           if (typeof payload.assistant_message_id === "string") {
-            setMessages((current) =>
+            setConversationMessages(targetConversationId, (current) =>
               current.map((item) => (item.id === assistantId ? { ...item, id: payload.assistant_message_id as string } : item))
             );
           }
-          const id = String(payload.conversation_id || conversationId || "");
-          if (id) await getMessages(id).then(setMessages);
+          const id = String(payload.conversation_id || targetConversationId || "");
+          if (id) await getMessages(id).then((rows) => setConversationMessages(id, rows));
           await Promise.all([refresh(), activeFileId ? getArtifacts(activeFileId).then(setArtifacts) : Promise.resolve()]);
         },
         onError: (payload) => {
-          setMessages((current) =>
+          setConversationMessages(targetConversationId, (current) =>
             current.map((item) =>
               item.id === assistantId ? { ...item, content: String(payload.detail || "Stream error") } : item
             )
@@ -1020,16 +1093,19 @@ function App() {
       }, controller.signal);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
-        setMessages((current) =>
+        setConversationMessages(targetConversationId, (current) =>
           current.map((item) => (item.id === assistantId ? { ...item, content: item.content || "已中断本轮对话。" } : item))
         );
       } else {
         throw err;
       }
     } finally {
-      chatAbortRef.current = null;
-      setBusy(false);
-      setStatus("");
+      delete chatAbortRefs.current[targetConversationId];
+      setChatRuns((current) => {
+        const next = { ...current };
+        delete next[targetConversationId];
+        return next;
+      });
     }
   }
 
@@ -1121,7 +1197,15 @@ function App() {
           : current
       );
     }
-    chatAbortRef.current?.abort();
+    if (conversationId && chatAbortRefs.current[conversationId]) {
+      chatAbortRefs.current[conversationId].abort();
+      delete chatAbortRefs.current[conversationId];
+      setChatRuns((current) => {
+        const next = { ...current };
+        delete next[conversationId];
+        return next;
+      });
+    }
     setBusy(false);
     setStatus("");
   }
@@ -1172,21 +1256,53 @@ function App() {
               <div className="conversation-row" key={conversation.id}>
                 <button
                   className={`list-item ${conversation.id === conversationId ? "selected" : ""}`}
-                  onClick={() => setConversationId(conversation.id)}
+                  onClick={() => {
+                    setConversationId(conversation.id);
+                    setOpenConversationMenuId(undefined);
+                  }}
                 >
-                  <strong>{conversation.title}</strong>
-                  <span>{new Date(conversation.updated_at).toLocaleString()}</span>
+                  <strong>
+                    {conversation.title}
+                    {chatRuns[conversation.id] && <span className="running-dot" title={chatRuns[conversation.id].status} />}
+                  </strong>
+                  <span>{chatRuns[conversation.id]?.status || new Date(conversation.updated_at).toLocaleString()}</span>
                 </button>
-                <button
-                  className="mini-icon-btn"
-                  type="button"
-                  title={text.deleteConversation}
-                  onClick={() => removeConversation(conversation.id).catch(console.error)}
-                >
-                  <Trash2 size={15} />
-                </button>
+                <div className="conversation-menu-wrap">
+                  <button
+                    className="mini-icon-btn"
+                    type="button"
+                    title="更多"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setOpenConversationMenuId((current) => (current === conversation.id ? undefined : conversation.id));
+                    }}
+                  >
+                    <MoreVertical size={15} />
+                  </button>
+                  {openConversationMenuId === conversation.id && (
+                    <div className="conversation-menu">
+                      <button type="button" onClick={() => renameConversationInline(conversation).catch(console.error)}>
+                        <Pencil size={14} />
+                        {text.renameConversation}
+                      </button>
+                      <button type="button" onClick={() => exportConversationInline(conversation, "markdown").catch(console.error)}>
+                        <Download size={14} />
+                        {text.exportMarkdown}
+                      </button>
+                      <button type="button" onClick={() => exportConversationInline(conversation, "json").catch(console.error)}>
+                        <Download size={14} />
+                        {text.exportJson}
+                      </button>
+                      <button className="danger-menu-item" type="button" onClick={() => removeConversation(conversation.id).catch(console.error)}>
+                        <Trash2 size={14} />
+                        {text.deleteConversation}
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
             ))}
+            {!conversations.length && <p className="empty-history">暂无历史对话</p>}
           </div>
         </section>
       </aside>
@@ -1202,11 +1318,11 @@ function App() {
               <RefreshCw size={17} />
               {text.inspect}
             </button>
-            <button type="button" onClick={() => submitChat(undefined, suggestions[0])} disabled={!activeFileId || busy}>
+            <button type="button" onClick={() => submitChat(undefined, suggestions[0])} disabled={!activeFileId || busy || chatBusy}>
               <Bot size={17} />
               {text.generate}
             </button>
-            <button type="button" onClick={() => submitChat(undefined, suggestions[4])} disabled={!activeFileId || busy}>
+            <button type="button" onClick={() => submitChat(undefined, suggestions[4])} disabled={!activeFileId || busy || chatBusy}>
               <BarChart3 size={17} />
               {text.coverage}
             </button>
@@ -1220,7 +1336,7 @@ function App() {
                 <article className={`message ${message.role}`} key={message.id}>
                   <div className="avatar">{message.role === "user" ? "U" : "A"}</div>
                   <div className="message-body">
-                    <pre>{message.content || (message.role === "assistant" && busy ? status || "Thinking" : "")}</pre>
+                    <pre>{message.content || (message.role === "assistant" && chatBusy ? activeChatRun?.status || "Thinking" : "")}</pre>
                     {coverageReports(message.tool_results?.items).map((report, index) => (
                       <CoverageReportCard key={`${message.id}-coverage-${index}`} report={report} />
                     ))}
@@ -1256,12 +1372,12 @@ function App() {
               <div className="composer-footer">
                 <span>{text.tabHint}</span>
                 <div className="composer-actions">
-                  {busy && (
+                  {chatBusy && (
                     <button className="stop-btn" type="button" title="中断当前任务" onClick={() => cancelCurrentWork().catch(console.error)}>
                       <Square size={16} />
                     </button>
                   )}
-                  <button className="send-btn" disabled={busy} type="submit">
+                  <button className="send-btn" disabled={busy || chatBusy} type="submit">
                     <Send size={18} />
                   </button>
                 </div>

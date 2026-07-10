@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import Conversation, Message, MessageFeedback, ToolCall, User
-from app.schemas import ChatRequest, ChatResponse, ConversationCreate, ConversationOut, MessageFeedbackIn, MessageFeedbackOut, MessageOut
+from app.schemas import ChatRequest, ChatResponse, ConversationCreate, ConversationOut, ConversationUpdate, MessageFeedbackIn, MessageFeedbackOut, MessageOut
 from app.security import get_current_user
 from app.services.agent_service import AgentService
 
@@ -19,6 +20,18 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def safe_export_name(title: str, suffix: str) -> str:
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff.-]+", "-", title.strip(), flags=re.UNICODE).strip("-")
+    return f"{cleaned or 'conversation'}.{suffix}"
+
+
+def owned_conversation(db: Session, user: User, conversation_id: str) -> Conversation:
+    conversation = db.get(Conversation, conversation_id)
+    if not conversation or conversation.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return conversation
 
 
 @router.post("/conversations", response_model=ConversationOut)
@@ -37,9 +50,7 @@ def list_conversations(db: Session = Depends(get_db), user: User = Depends(get_c
 
 @router.delete("/conversations/{conversation_id}")
 def delete_conversation(conversation_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    conversation = db.get(Conversation, conversation_id)
-    if not conversation or conversation.user_id != user.id:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    conversation = owned_conversation(db, user, conversation_id)
     message_ids = [
         row.id
         for row in db.query(Message.id)
@@ -60,11 +71,88 @@ def delete_conversation(conversation_id: str, db: Session = Depends(get_db), use
     return {"ok": True, "deleted_conversation_id": conversation_id}
 
 
+@router.patch("/conversations/{conversation_id}", response_model=ConversationOut)
+def rename_conversation(
+    conversation_id: str,
+    payload: ConversationUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    conversation = owned_conversation(db, user, conversation_id)
+    conversation.title = payload.title.strip()
+    conversation.updated_at = dt.datetime.utcnow()
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+    return conversation
+
+
+@router.get("/conversations/{conversation_id}/export")
+def export_conversation(
+    conversation_id: str,
+    format: str = "markdown",
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    conversation = owned_conversation(db, user, conversation_id)
+    messages = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at.asc(), Message.id.asc())
+        .all()
+    )
+    export_format = format.lower()
+    if export_format not in {"markdown", "json"}:
+        raise HTTPException(status_code=400, detail="Unsupported export format")
+    if export_format == "json":
+        payload = {
+            "conversation": {
+                "id": conversation.id,
+                "title": conversation.title,
+                "active_file_id": conversation.active_file_id,
+                "updated_at": conversation.updated_at.isoformat() if conversation.updated_at else None,
+            },
+            "messages": [
+                {
+                    "id": message.id,
+                    "role": message.role,
+                    "content": message.content,
+                    "tool_results": message.tool_results,
+                    "created_at": message.created_at.isoformat() if message.created_at else None,
+                }
+                for message in messages
+            ],
+        }
+        return Response(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            media_type="application/json; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{safe_export_name(conversation.title, "json")}"'},
+        )
+
+    lines = [
+        f"# {conversation.title}",
+        "",
+        f"- Conversation ID: `{conversation.id}`",
+        f"- Exported at: `{dt.datetime.utcnow().isoformat()}Z`",
+        "",
+    ]
+    for message in messages:
+        role = "User" if message.role == "user" else "Assistant"
+        created = message.created_at.isoformat() if message.created_at else ""
+        lines.extend([f"## {role} - {created}", "", message.content or "", ""])
+        items = (message.tool_results or {}).get("items") if isinstance(message.tool_results, dict) else None
+        if items:
+            lines.extend(["<details>", "<summary>Tool results</summary>", "", "```json", json.dumps(items, ensure_ascii=False, indent=2), "```", "", "</details>", ""])
+    return Response(
+        "\n".join(lines),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{safe_export_name(conversation.title, "md")}"'},
+    )
+
+
 @router.get("/conversations/{conversation_id}/messages", response_model=list[MessageOut])
 def list_messages(conversation_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    conversation = db.get(Conversation, conversation_id)
-    if not conversation or conversation.user_id != user.id:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    owned_conversation(db, user, conversation_id)
     return (
         db.query(Message)
         .filter(Message.conversation_id == conversation_id)

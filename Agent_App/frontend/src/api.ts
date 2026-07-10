@@ -141,6 +141,28 @@ export function deleteConversation(conversationId: string) {
   });
 }
 
+export function renameConversation(conversationId: string, title: string) {
+  return request<Conversation>(`/chat/conversations/${conversationId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ title })
+  });
+}
+
+export async function exportConversation(conversation: Conversation, format: "markdown" | "json" = "markdown") {
+  const response = await fetch(`${API_BASE}/chat/conversations/${conversation.id}/export?format=${encodeURIComponent(format)}`, {
+    headers: { Authorization: `Bearer ${token()}` }
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const safeTitle = conversation.title.replace(/[\\/:*?"<>|]+/g, "-").trim() || "conversation";
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${safeTitle}.${format === "json" ? "json" : "md"}`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 export function getMessages(conversationId: string) {
   return request<Message[]>(`/chat/conversations/${conversationId}/messages`);
 }

@@ -30,6 +30,10 @@ class ConversationCreate(BaseModel):
     title: str = "新对话"
 
 
+class ConversationUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+
+
 class ConversationOut(BaseModel):
     id: str
     title: str
