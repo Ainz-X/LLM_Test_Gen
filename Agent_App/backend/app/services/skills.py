@@ -118,6 +118,16 @@ DEFAULT_SKILL_REGISTRY = SkillRegistry(
             max_steps=1,
         ),
         AgentSkill(
+            id="tool_observability",
+            label="Tool observability",
+            summary="Explain which skills and tools were actually used in this conversation.",
+            tools=("list_tool_history", "list_skills"),
+            intents=("list_tool_history",),
+            read_only=True,
+            side_effecting=False,
+            max_steps=1,
+        ),
+        AgentSkill(
             id="code_understanding",
             label="Code understanding",
             summary="Read uploaded Java structure and extracted A3 context such as FQN, signatures, Jimple, fields, helpers, and throws.",

@@ -14,7 +14,6 @@ import {
   PackageOpen,
   Pencil,
   Plus,
-  RefreshCw,
   Send,
   Square,
   ThumbsDown,
@@ -44,7 +43,6 @@ import {
   getConversations,
   getFiles,
   getMessages,
-  inspectWorkspace,
   login,
   logout,
   rateMessage,
@@ -69,9 +67,8 @@ const text = {
   newChat: "\u65b0\u5bf9\u8bdd",
   history: "\u5386\u53f2\u5bf9\u8bdd",
   title: "Java \u6d4b\u8bd5\u751f\u6210 Agent",
-  noFile: "\u4e0a\u4f20 Java \u6587\u4ef6\uff0c\u6216\u68c0\u67e5 A3 \u5de5\u4f5c\u533a",
+  noFile: "上传 Java 文件或项目 zip",
   activeFile: "\u5f53\u524d\u6587\u4ef6\uff1a",
-  inspect: "\u68c0\u67e5",
   generate: "\u751f\u6210\u6d4b\u8bd5",
   coverage: "\u8986\u76d6\u7387",
   toolResults: "\u4e2a\u5de5\u5177\u7ed3\u679c",
@@ -107,9 +104,7 @@ const text = {
   download: "\u4e0b\u8f7d",
   close: "\u5173\u95ed",
   loading: "\u52a0\u8f7d\u4e2d...",
-  noArtifact: "\u5c1a\u672a\u9009\u62e9\u4ea7\u7269",
-  snapshot: "\u5de5\u4f5c\u533a\u5feb\u7167",
-  notLoaded: "\u5c1a\u672a\u52a0\u8f7d"
+  noArtifact: "\u5c1a\u672a\u9009\u62e9\u4ea7\u7269"
 };
 
 const suggestions = [
@@ -414,7 +409,6 @@ function App() {
   const [dropActive, setDropActive] = useState(false);
   const [pendingUploadFiles, setPendingUploadFiles] = useState<File[]>([]);
   const [status, setStatus] = useState("");
-  const [workspaceSummary, setWorkspaceSummary] = useState<Record<string, unknown> | null>(null);
   const [suggestionIndex, setSuggestionIndex] = useState(0);
   const [typedSuggestion, setTypedSuggestion] = useState("");
   const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
@@ -1237,10 +1231,6 @@ function App() {
     setStatus("");
   }
 
-  async function loadWorkspace() {
-    setWorkspaceSummary(await inspectWorkspace());
-  }
-
   function openPreview(artifact: Artifact) {
     setSelectedArtifact(artifact);
     setPreviewOpen(true);
@@ -1371,10 +1361,6 @@ function App() {
             <p>{activeFile ? `${text.activeFile}${activeFile.original_name}` : text.noFile}</p>
           </div>
           <div className="header-actions">
-            <button type="button" onClick={loadWorkspace}>
-              <RefreshCw size={17} />
-              {text.inspect}
-            </button>
             <button type="button" onClick={() => submitChat(undefined, suggestions[0])} disabled={!activeFileId || chatBusy}>
               <Bot size={17} />
               {text.generate}
@@ -1591,11 +1577,6 @@ function App() {
                   </div>
                 ))}
               </div>
-            </section>
-
-            <section className="side-section">
-              <div className="section-title">{text.snapshot}</div>
-              <pre className="json-box">{workspaceSummary ? JSON.stringify(workspaceSummary, null, 2) : text.notLoaded}</pre>
             </section>
           </aside>
         </div>

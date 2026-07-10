@@ -413,6 +413,127 @@ def format_source_file_catalog(result: dict[str, Any], message: str) -> str:
     return "\n".join(lines)
 
 
+CANONICAL_TASKS = {
+    "run_coverage": "Run compile, JUnit, and JaCoCo coverage for generated tests. This is coverage analysis, not test generation.",
+    "batch_generate_tests": "Batch-generate JUnit 4 tests in one backend tool call.",
+    "repair_latest": "Repair the latest generated test artifact for the active Java file.",
+    "diagnose_latest": "Run a compile/diagnosis action for the latest generated test artifact.",
+    "generate_tests": "Generate one JUnit 4 test artifact for the active Java file.",
+    "read_code_context": "Read extracted A3 code context for the active Java file, including FQN, method signatures, Jimple, method source, field context, helper signatures, and throws/modifiers when available.",
+    "describe_current_file": "Read the active Java file analysis and answer structural questions such as FQN, package, imports, and methods.",
+    "list_source_files": "List uploaded Java files by source role and answer which files are production source or test source.",
+    "explain_latest_test": "Explain what the latest generated JUnit test is testing. This is read-only.",
+    "list_artifacts": "List generated artifacts for the active Java file. This is read-only.",
+    "list_tool_history": "List the skills and tools actually called in the recent conversation.",
+    "analyze_file": "Analyze the active Java file structure. This is read-only.",
+    "list_skills": "List the agent skills, their tool boundaries, and their risk profile.",
+    "remember": "Store a stable user preference or project fact.",
+    "chat": "Answer in Chinese without changing state.",
+}
+
+INTENT_MODES = {
+    "run_coverage": "act",
+    "batch_generate_tests": "act",
+    "repair_latest": "act",
+    "diagnose_latest": "act",
+    "generate_tests": "act",
+    "remember": "act",
+    "read_code_context": "read",
+    "describe_current_file": "read",
+    "list_source_files": "read",
+    "explain_latest_test": "read",
+    "list_artifacts": "read",
+    "list_tool_history": "read",
+    "analyze_file": "read",
+    "list_skills": "read",
+    "chat": "ask",
+}
+
+SIDE_EFFECTING_INTENTS = {
+    intent
+    for intent, mode in INTENT_MODES.items()
+    if mode == "act"
+}
+
+
+def normalized_request(
+    message: str,
+    file_id: str | None,
+    intent: str,
+    mode: str | None = None,
+    *,
+    route_source: str = "fallback_rules",
+    router_reason: str = "",
+    confidence: float | None = None,
+    target_scope: str | None = None,
+) -> dict[str, Any]:
+    if intent not in CANONICAL_TASKS:
+        intent = "chat"
+    mode = mode if mode in {"ask", "read", "act"} else INTENT_MODES[intent]
+    if mode == "act" and intent not in SIDE_EFFECTING_INTENTS:
+        mode = INTENT_MODES[intent]
+    skill = DEFAULT_SKILL_REGISTRY.for_intent(intent, mode)
+    return {
+        "raw": message,
+        "language": "zh-CN",
+        "intent": intent,
+        "mode": mode,
+        "side_effecting": mode == "act",
+        "scope": target_scope or ("active_file" if file_id else "conversation"),
+        "active_file_id": file_id,
+        "canonical": CANONICAL_TASKS[intent],
+        "skill_id": skill.id,
+        "skill": skill.brief(),
+        "allowed_tools": list(skill.tools),
+        "route_source": route_source,
+        "router_reason": router_reason,
+        "confidence": confidence,
+    }
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            raise
+        parsed = json.loads(match.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError("router returned non-object JSON")
+    return parsed
+
+
+def format_tool_history(result: dict[str, Any]) -> str:
+    calls = result.get("calls") if isinstance(result.get("calls"), list) else []
+    if not calls:
+        return "当前对话里还没有记录到工具调用。"
+    lines = ["最近实际调用过这些 skill / tool："]
+    for call in calls:
+        skill = call.get("skill") or {}
+        skill_id = skill.get("id") or call.get("skill_id") or "unknown"
+        tool = call.get("tool") or "unknown"
+        created_at = call.get("created_at") or ""
+        status = "成功" if call.get("ok") else "失败/被拦截"
+        lines.append(f"- `{skill_id}` / `{tool}`：{status}，{created_at}")
+    return "\n".join(lines)
+
+
+def is_bulk_coverage_request(message: str, normalized: dict[str, Any], selected_file_ids: list[str] | None = None) -> bool:
+    if normalized.get("intent") != "run_coverage":
+        return False
+    scope = str(normalized.get("scope") or "").lower()
+    lower = message.lower()
+    bulk_scope = scope in {"all_artifacts", "all_files", "selected_files", "project", "workspace"}
+    bulk_words = any(token in lower for token in ["所有", "全部", "all", "批量", "整个项目", "全项目"])
+    multiple_selected = len(selected_file_ids or []) > 1
+    return bulk_scope or bulk_words or multiple_selected
+
+
 def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
     lower = message.lower()
     intent = "chat"
@@ -508,6 +629,18 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
         "有什么功能",
         "功能列表",
     ]
+    tool_history_tokens = [
+        "刚刚调用",
+        "刚才调用",
+        "上次调用",
+        "调用了哪些",
+        "哪些工具",
+        "哪些skill",
+        "哪些 skills",
+        "tool history",
+        "tools used",
+        "called tools",
+    ]
 
     is_question = any(token in lower for token in question_tokens)
     wants_test = any(token in lower for token in test_tokens)
@@ -519,8 +652,20 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
     wants_file_inventory = any(token in lower for token in file_inventory_tokens)
     wants_file_info = bool(file_id) and any(token in lower for token in file_info_tokens)
     wants_code_context = bool(file_id) and any(token in lower for token in code_context_tokens)
+    wants_coverage = any(token in lower for token in ["coverage", "jacoco", "覆盖率"])
+    wants_tool_history = any(token in lower for token in tool_history_tokens)
 
-    if wants_file_inventory and not (wants_generate or wants_run):
+    if wants_tool_history:
+        intent = "list_tool_history"
+        mode = "read"
+    elif wants_coverage:
+        if wants_run and not is_question:
+            intent = "run_coverage"
+            mode = "act"
+        else:
+            intent = "chat"
+            mode = "ask"
+    elif wants_file_inventory and not (wants_generate or wants_run):
         intent = "list_source_files"
         mode = "read"
     elif any(token in lower for token in capability_tokens):
@@ -541,13 +686,6 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
     elif wants_generate and wants_test:
         intent = "generate_tests"
         mode = "act"
-    elif any(token in lower for token in ["coverage", "jacoco", "覆盖率"]):
-        if wants_run and not is_question:
-            intent = "run_coverage"
-            mode = "act"
-        else:
-            intent = "chat"
-            mode = "ask"
     elif any(token in lower for token in ["repair", "fix", "修复"]):
         intent = "repair_latest"
         mode = "act"
@@ -571,36 +709,7 @@ def normalize_user_request(message: str, file_id: str | None) -> dict[str, Any]:
         intent = "remember"
         mode = "act"
 
-    canonical_map = {
-        "run_coverage": "Run compile, JUnit, and JaCoCo coverage for the latest generated test of the active Java file.",
-        "batch_generate_tests": "Batch-generate JUnit 4 tests in one backend tool call.",
-        "repair_latest": "Repair the latest generated test artifact for the active Java file.",
-        "diagnose_latest": "Run a compile/diagnosis action for the latest generated test artifact.",
-        "generate_tests": "Generate one JUnit 4 test artifact for the active Java file.",
-        "read_code_context": "Read extracted A3 code context for the active Java file, including FQN, method signatures, Jimple, method source, field context, helper signatures, and throws/modifiers when available.",
-        "describe_current_file": "Read the active Java file analysis and answer structural questions such as FQN, package, imports, and methods.",
-        "list_source_files": "List uploaded Java files by source role and answer which files are production source or test source.",
-        "explain_latest_test": "Explain what the latest generated JUnit test is testing. This is read-only.",
-        "list_artifacts": "List generated artifacts for the active Java file. This is read-only.",
-        "analyze_file": "Analyze the active Java file structure. This is read-only.",
-        "list_skills": "List the agent skills, their tool boundaries, and their risk profile.",
-        "remember": "Store a stable user preference or project fact.",
-        "chat": "Answer in Chinese without changing state. Read-only tools are allowed only when the intent is normalized to read mode.",
-    }
-    skill = DEFAULT_SKILL_REGISTRY.for_intent(intent, mode)
-    return {
-        "raw": message,
-        "language": "zh-CN",
-        "intent": intent,
-        "mode": mode,
-        "side_effecting": mode == "act",
-        "scope": "active_file" if file_id else "conversation",
-        "active_file_id": file_id,
-        "canonical": canonical_map[intent],
-        "skill_id": skill.id,
-        "skill": skill.brief(),
-        "allowed_tools": list(skill.tools),
-    }
+    return normalized_request(message, file_id, intent, mode)
 
 
 def ask_mode_reply(message: str, file_id: str | None) -> str:
@@ -693,6 +802,91 @@ class AgentService:
         if settings.openai_base_url:
             kwargs["base_url"] = settings.openai_base_url
         return OpenAI(**kwargs)
+
+    def route_user_request(
+        self,
+        message: str,
+        file_id: str | None,
+        selected_file_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        fallback = normalize_user_request(message, file_id)
+        if not settings.openai_api_key:
+            return fallback
+        selected_count = len(selected_file_ids or [])
+        intent_catalog = "\n".join(
+            f"- {intent}: mode={INTENT_MODES[intent]}, skill={DEFAULT_SKILL_REGISTRY.for_intent(intent, INTENT_MODES[intent]).id}, task={task}"
+            for intent, task in CANONICAL_TASKS.items()
+        )
+        system = (
+            "You are an intent router for a Java test-generation agent. "
+            "Classify the user's semantic intent; do not rely on keyword matching. "
+            "Return JSON only. Valid keys: intent, mode, scope, confidence, reason. "
+            "Important distinctions: "
+            "1) '已生成测试' or 'generated tests' means existing artifacts; it is not a request to generate new tests. "
+            "2) Coverage/Jacoco/覆盖率/运行测试覆盖率 must route to run_coverage, not test_generation. "
+            "3) Questions like '刚刚调用了哪些 skill/tools' ask for actual tool history, route to list_tool_history. "
+            "4) Questions about what the agent can do route to list_skills. "
+            "5) Only use mode=act when the user clearly asks to execute a state-changing or resource-consuming action. "
+            "6) If unclear, choose chat/ask."
+        )
+        user = (
+            f"Available intents:\n{intent_catalog}\n\n"
+            f"Context:\nactive_file_id={file_id or '<none>'}\nselected_file_count={selected_count}\n\n"
+            f"User message:\n{message}"
+        )
+        try:
+            response = self.llm_client().chat.completions.create(
+                model=settings.openai_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0,
+            )
+            raw = response.choices[0].message.content or ""
+            parsed = extract_json_object(raw)
+            intent = str(parsed.get("intent") or fallback["intent"])
+            mode = str(parsed.get("mode") or INTENT_MODES.get(intent, fallback["mode"])).lower()
+            mode = {
+                "action": "act",
+                "execute": "act",
+                "side_effect": "act",
+                "side-effect": "act",
+                "readonly": "read",
+                "read_only": "read",
+                "read-only": "read",
+                "question": "ask",
+            }.get(mode, mode)
+            scope = str(parsed.get("scope") or fallback.get("scope") or "")
+            reason = str(parsed.get("reason") or "")
+            confidence_value = parsed.get("confidence")
+            try:
+                confidence = float(confidence_value) if confidence_value is not None else None
+            except (TypeError, ValueError):
+                confidence = None
+            if intent not in CANONICAL_TASKS:
+                return fallback | {
+                    "route_source": "fallback_rules",
+                    "router_reason": f"LLM router returned invalid intent `{intent}`; fallback used.",
+                }
+            # Final safety rail: router may choose the action, but side effects still need explicit act mode.
+            if intent in SIDE_EFFECTING_INTENTS and mode != "act":
+                intent = "chat"
+                mode = "ask"
+            return normalized_request(
+                message,
+                file_id,
+                intent,
+                mode,
+                route_source="llm_router",
+                router_reason=reason,
+                confidence=confidence,
+                target_scope=scope or None,
+            )
+        except Exception as exc:
+            fallback["route_source"] = "fallback_rules"
+            fallback["router_reason"] = f"LLM router failed: {type(exc).__name__}: {exc}"
+            return fallback
 
     def memories(self) -> list[AgentMemory]:
         return (
@@ -1472,6 +1666,34 @@ class AgentService:
             "skills": DEFAULT_SKILL_REGISTRY.catalog(),
         }
 
+    def tool_list_tool_history(self, args: dict[str, Any]) -> dict[str, Any]:
+        limit = max(1, min(int(args.get("limit", 8)), 30))
+        conversation_id = args.get("conversation_id")
+        query = self.db.query(ToolCall).filter(ToolCall.user_id == self.user.id)
+        if conversation_id:
+            query = query.filter(ToolCall.conversation_id == conversation_id)
+        rows = query.order_by(ToolCall.created_at.desc()).limit(limit).all()
+        calls: list[dict[str, Any]] = []
+        for row in rows:
+            result = row.result if isinstance(row.result, dict) else {}
+            skill = result.get("skill") if isinstance(result.get("skill"), dict) else DEFAULT_SKILL_REGISTRY.for_tool(row.tool_name).brief()
+            calls.append(
+                {
+                    "id": row.id,
+                    "tool": row.tool_name,
+                    "arguments": row.arguments,
+                    "ok": result.get("ok", True),
+                    "skill": skill,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                }
+            )
+        return {
+            "ok": True,
+            "tool": "list_tool_history",
+            "conversation_id": conversation_id,
+            "calls": calls,
+        }
+
     def tool_remember(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.remember(args["key"], args["value"], "user-request")
 
@@ -1494,6 +1716,7 @@ class AgentService:
             "diagnose_artifact": self.tool_diagnose_artifact,
             "repair_artifact": self.tool_repair_artifact,
             "read_memories": self.tool_read_memories,
+            "list_tool_history": self.tool_list_tool_history,
             "remember": self.tool_remember,
         }
 
@@ -1505,6 +1728,21 @@ class AgentService:
                     "name": "list_skills",
                     "description": "List the agent skill catalog, allowed tools, and side-effect policy.",
                     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_tool_history",
+                    "description": "List the skills and tools actually called recently in this conversation. Use when the user asks what was just called or which tools/skills were used.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "conversation_id": {"type": "string"},
+                            "limit": {"type": "integer"},
+                        },
+                        "additionalProperties": False,
+                    },
                 },
             },
             {
@@ -1762,11 +2000,14 @@ class AgentService:
             latest = self.latest_artifact_for_file(file_id)
             if latest:
                 args["artifact_id"] = latest.id
+        if name == "list_tool_history" and conversation_id and "conversation_id" not in args:
+            args["conversation_id"] = conversation_id
 
         limits = {
             "inspect_workspace": 1,
             "validate_workspace": 1,
             "prepare_feedback_round": 1,
+            "list_tool_history": 1,
             "list_files": 1,
             "analyze_file": 1,
             "read_code_context": 1,
@@ -1828,8 +2069,10 @@ class AgentService:
         message: str,
         file_id: str | None,
         selected_file_ids: list[str] | None = None,
+        conversation_id: str | None = None,
+        normalized: dict[str, Any] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
-        normalized = normalize_user_request(message, file_id)
+        normalized = normalized or normalize_user_request(message, file_id)
         if normalized.get("mode") == "ask":
             return ask_mode_reply(message, file_id), []
         lower = message.lower()
@@ -1842,6 +2085,10 @@ class AgentService:
             result = self.tool_list_skills({})
             results.append(result)
             reply = format_skill_catalog(result.get("skills") or [])
+        elif normalized["intent"] == "list_tool_history":
+            result = self.tool_list_tool_history({"conversation_id": conversation_id, "limit": 8})
+            results.append(result)
+            reply = format_tool_history(result)
         elif normalized["intent"] == "list_source_files":
             result = self.tool_list_files({"only_missing_tests": False, "limit": 500})
             results.append(result)
@@ -1939,6 +2186,13 @@ class AgentService:
                     reply = coverage_summary_text(coverage_result.get("coverage"))
                 else:
                     reply = "覆盖率没有跑成：" + concise_failure_reason(coverage_result)
+        elif normalized["intent"] == "run_coverage":
+            results.append(self.tool_list_artifacts({"limit": 20}))
+            reply = (
+                "这个请求已经被识别为 `coverage_analysis`，不是生成测试。"
+                "当前对话执行覆盖率需要一个明确的生产源码或对应 artifact；请在右侧选择生产源码后运行覆盖率，"
+                "或者在生成产物列表中选定具体测试产物。"
+            )
         elif file_id and normalized["intent"] == "_legacy_run_coverage":
             latest = self.latest_artifact_for_file(file_id)
             if latest is None:
@@ -2016,12 +2270,12 @@ class AgentService:
         history: list[dict[str, str]],
         selected_file_ids: list[str] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
+        normalized = self.route_user_request(message, file_id, selected_file_ids)
         if not settings.openai_api_key:
-            return self.scripted_chat(message, file_id, selected_file_ids)
+            return self.scripted_chat(message, file_id, selected_file_ids, conversation_id, normalized)
 
-        normalized = normalize_user_request(message, file_id)
         if normalized["mode"] in {"act", "read"} or normalized["intent"] != "chat":
-            return self.scripted_chat(message, file_id, selected_file_ids)
+            return self.scripted_chat(message, file_id, selected_file_ids, conversation_id, normalized)
         memory_text = "\n".join(f"- {memory.key}: {memory.value}" for memory in self.memories())
         feedback_text = self.feedback_summary()
         system = (
@@ -2049,12 +2303,6 @@ class AgentService:
         messages.append({"role": "user", "content": f"用户原话：{message}\n标准化任务：{normalized['canonical']}"})
 
         client = self.llm_client()
-        response = client.chat.completions.create(
-            model=settings.openai_model,
-            messages=messages,
-            temperature=0.2,
-        )
-        return response.choices[0].message.content or "", []
         results: list[dict[str, Any]] = []
         seen_calls: set[str] = set()
         call_counts: dict[str, int] = {}
@@ -2104,7 +2352,7 @@ class AgentService:
                         }
                     )
         except Exception as exc:
-            fallback_reply, fallback_results = self.scripted_chat(message, file_id, selected_file_ids)
+            fallback_reply, fallback_results = self.scripted_chat(message, file_id, selected_file_ids, conversation_id, normalized)
             error_result = {"ok": False, "tool": "llm_chat", "error": f"{type(exc).__name__}: {exc}"}
             return f"LLM call failed, so I used local fallback.\n{fallback_reply}", [error_result, *results, *fallback_results]
 
@@ -2170,12 +2418,29 @@ class AgentService:
         history: list[dict[str, str]],
         selected_file_ids: list[str] | None = None,
     ) -> Iterator[dict[str, Any]]:
-        normalized = normalize_user_request(message, file_id)
+        normalized = self.route_user_request(message, file_id, selected_file_ids)
         if normalized["intent"] == "run_coverage":
+            if is_bulk_coverage_request(message, normalized, selected_file_ids):
+                yield {"event": "status", "message": "正在执行：识别覆盖率目标"}
+                result = self.tool_list_artifacts({"limit": 50})
+                result.setdefault("skill", DEFAULT_SKILL_REGISTRY.for_intent("run_coverage", "act").brief())
+                compact = compact_tool_result(result)
+                self.record_tool(conversation_id, "list_artifacts", {"limit": 50}, compact)
+                yield {"event": "tool", "data": compact}
+                artifact_count = len(result.get("artifacts") or [])
+                reply = (
+                    f"我已识别为 `coverage_analysis`，不是 `test_generation`。当前找到 {artifact_count} 个生成产物。"
+                    "不过“所有已生成测试的覆盖率”属于长时间批量覆盖率任务，当前对话流还没有接成可中断后台批处理；"
+                    "我不会偷偷降级为生成测试，也不会只跑某一个文件来假装完成。"
+                    "现在请先选择一个生产源码运行覆盖率；下一步应该把批量覆盖率做成和“生成未测”一样的后台任务，带真实进度和强制中断。"
+                )
+                for index in range(0, len(reply), 18):
+                    yield {"event": "delta", "text": reply[index : index + 18]}
+                return
             yield from self.latest_coverage_events(conversation_id, file_id)
             return
         if not settings.openai_api_key:
-            reply, tool_results = self.scripted_chat(message, file_id, selected_file_ids)
+            reply, tool_results = self.scripted_chat(message, file_id, selected_file_ids, conversation_id, normalized)
             for result in tool_results:
                 yield {"event": "tool", "data": result}
             for index in range(0, len(reply), 18):
@@ -2184,7 +2449,7 @@ class AgentService:
 
         if normalized["mode"] in {"act", "read"} or normalized["intent"] != "chat":
             yield {"event": "status", "message": f"正在执行：{normalized['canonical']}"}
-            reply, tool_results = self.scripted_chat(message, file_id, selected_file_ids)
+            reply, tool_results = self.scripted_chat(message, file_id, selected_file_ids, conversation_id, normalized)
             for result in tool_results:
                 yield {"event": "tool", "data": result}
             for index in range(0, len(reply), 18):
@@ -2221,28 +2486,6 @@ class AgentService:
             ),
         }
         streamed_any_text = False
-        try:
-            stream = client.chat.completions.create(
-                model=settings.openai_model,
-                messages=messages,
-                temperature=0.2,
-                stream=True,
-            )
-            for chunk in stream:
-                if not chunk.choices:
-                    continue
-                text = getattr(chunk.choices[0].delta, "content", None)
-                if text:
-                    yield {"event": "delta", "text": text}
-            return
-        except Exception as exc:
-            fallback_reply, fallback_results = self.scripted_chat(message, file_id, selected_file_ids)
-            yield {"event": "tool", "data": {"ok": False, "tool": "llm_chat_stream", "error": f"{type(exc).__name__}: {exc}"}}
-            for result in fallback_results:
-                yield {"event": "tool", "data": result}
-            for index in range(0, len(fallback_reply), 18):
-                yield {"event": "delta", "text": fallback_reply[index : index + 18]}
-            return
         seen_calls: set[str] = set()
         call_counts: dict[str, int] = {}
 
@@ -2326,7 +2569,7 @@ class AgentService:
                         }
                     )
         except Exception as exc:
-            fallback_reply, fallback_results = self.scripted_chat(message, file_id, selected_file_ids)
+            fallback_reply, fallback_results = self.scripted_chat(message, file_id, selected_file_ids, conversation_id, normalized)
             yield {"event": "tool", "data": {"ok": False, "tool": "llm_chat_stream", "error": f"{type(exc).__name__}: {exc}"}}
             for result in fallback_results:
                 yield {"event": "tool", "data": result}
