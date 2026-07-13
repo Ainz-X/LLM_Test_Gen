@@ -168,6 +168,16 @@ DEFAULT_SKILL_REGISTRY = SkillRegistry(
             max_steps=1,
         ),
         AgentSkill(
+            id="coverage_repair",
+            label="Coverage-guided test repair",
+            summary="Measure JaCoCo coverage, create a targeted improved test, then verify whether coverage actually increased.",
+            tools=("list_artifacts", "run_coverage", "diagnose_artifact", "repair_artifact"),
+            intents=("repair_low_coverage",),
+            read_only=False,
+            side_effecting=True,
+            max_steps=3,
+        ),
+        AgentSkill(
             id="test_repair",
             label="Test repair",
             summary="Diagnose compile or runtime failures and create repaired versions of generated tests.",

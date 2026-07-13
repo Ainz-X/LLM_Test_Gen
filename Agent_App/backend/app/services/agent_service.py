@@ -381,6 +381,77 @@ def coverage_summary_text(coverage: Any) -> str:
     return f"已完成 JaCoCo 覆盖率。`{class_name}`：{metrics}。"
 
 
+def coverage_target_metrics(coverage: Any) -> dict[str, Any]:
+    """Return only the target metrics that are meaningful for a repair decision."""
+    if not isinstance(coverage, dict):
+        return {}
+    target = coverage.get("target")
+    if not isinstance(target, dict):
+        return {}
+    metrics: dict[str, Any] = {"class": target.get("class") or coverage.get("target_class")}
+    for key in ("instruction", "branch", "line", "method", "complexity"):
+        value = target.get(key)
+        if isinstance(value, dict):
+            metrics[key] = {
+                "covered": value.get("covered"),
+                "missed": value.get("missed"),
+                "total": value.get("total"),
+                "percent": value.get("percent"),
+            }
+    return metrics
+
+
+def coverage_repair_instruction(coverage: Any) -> str:
+    metrics = coverage_target_metrics(coverage)
+    return (
+        "Improve the JaCoCo coverage of this test, not merely its compilation status. "
+        "Preserve valid assertions and add focused JUnit 4 test methods for behavior that the existing test misses. "
+        "Use source-level branches, boundary values, exception paths, and public/package-visible APIs as concrete targets. "
+        "Do not add placeholder assertions or tests that only instantiate the class. "
+        f"Measured baseline metrics: {json.dumps(metrics, ensure_ascii=False)}"
+    )
+
+
+def coverage_comparison(before: Any, after: Any) -> dict[str, Any]:
+    before_metrics = coverage_target_metrics(before)
+    after_metrics = coverage_target_metrics(after)
+    changes: dict[str, Any] = {}
+    for key in ("instruction", "branch", "line", "method", "complexity"):
+        previous = before_metrics.get(key) if isinstance(before_metrics.get(key), dict) else {}
+        current = after_metrics.get(key) if isinstance(after_metrics.get(key), dict) else {}
+        before_percent = previous.get("percent")
+        after_percent = current.get("percent")
+        if isinstance(before_percent, (int, float)) and isinstance(after_percent, (int, float)):
+            changes[key] = {
+                "before": before_percent,
+                "after": after_percent,
+                "delta": round(after_percent - before_percent, 2),
+            }
+    line_delta = (changes.get("line") or {}).get("delta")
+    instruction_delta = (changes.get("instruction") or {}).get("delta")
+    return {
+        "before": before_metrics,
+        "after": after_metrics,
+        "changes": changes,
+        "improved": bool(
+            (isinstance(line_delta, (int, float)) and line_delta > 0)
+            or (isinstance(instruction_delta, (int, float)) and instruction_delta > 0)
+        ),
+    }
+
+
+def coverage_comparison_text(comparison: dict[str, Any]) -> str:
+    changes = comparison.get("changes") if isinstance(comparison.get("changes"), dict) else {}
+    line = changes.get("line") if isinstance(changes.get("line"), dict) else None
+    branch = changes.get("branch") if isinstance(changes.get("branch"), dict) else None
+    parts: list[str] = []
+    if line:
+        parts.append(f"行覆盖率 {line.get('before')}% -> {line.get('after')}% ({line.get('delta'):+.2f}%)")
+    if branch:
+        parts.append(f"分支覆盖率 {branch.get('before')}% -> {branch.get('after')}% ({branch.get('delta'):+.2f}%)")
+    return "；".join(parts) or "JaCoCo 未返回可对比的目标类行/分支指标。"
+
+
 def format_skill_catalog(skills: list[dict[str, Any]]) -> str:
     lines = ["当前 agent 已注册这些 skills："]
     for skill in skills:
@@ -417,6 +488,7 @@ CANONICAL_TASKS = {
     "run_coverage": "Run compile, JUnit, and JaCoCo coverage for generated tests. This is coverage analysis, not test generation.",
     "run_single_coverage": "Run compile, JUnit, and JaCoCo coverage for the latest generated test of the active production Java file.",
     "run_batch_coverage": "Plan or run coverage for multiple generated test artifacts. This is a long-running batch coverage task, not test generation.",
+    "repair_low_coverage": "Measure the active file's JaCoCo baseline, create a coverage-targeted JUnit test improvement, rerun coverage, and report whether coverage actually increased.",
     "batch_generate_tests": "Batch-generate JUnit 4 tests in one backend tool call.",
     "generate_selected_tests": "Generate JUnit 4 tests only for the currently selected production Java files.",
     "generate_project_missing_tests": "Generate JUnit 4 tests for project production Java files that do not already have generated test artifacts.",
@@ -440,6 +512,7 @@ INTENT_MODES = {
     "run_coverage": "act",
     "run_single_coverage": "act",
     "run_batch_coverage": "act",
+    "repair_low_coverage": "act",
     "batch_generate_tests": "act",
     "generate_selected_tests": "act",
     "generate_project_missing_tests": "act",
@@ -564,6 +637,24 @@ def high_confidence_fallback_intent(
     lower = message.lower()
     selected_count = len(selected_file_ids or [])
     has_active_file = bool(file_id)
+    coverage_repair_words = (
+        "repair",
+        "fix",
+        "improve",
+        "increase coverage",
+        "low coverage",
+        "coverage is low",
+        "提高",
+        "提升",
+        "提升覆盖率",
+        "提高覆盖率",
+        "覆盖率很低",
+        "覆盖率低",
+        "补测",
+        "补充测试",
+        "修复一下",
+        "修复覆盖率",
+    )
 
     ask_words = ("?", "？", "为什么", "怎么", "如何", "是否", "可否", "能不能", "可以吗", "有必要")
     run_words = ("run", "execute", "运行", "执行", "跑一下", "跑")
@@ -611,6 +702,8 @@ def high_confidence_fallback_intent(
         return "list_tool_history", "read", "conversation"
     if contains_any(lower, capability_words):
         return "list_skills", "read", "conversation"
+    if contains_any(lower, coverage_words) and contains_any(lower, coverage_repair_words) and not is_question:
+        return "repair_low_coverage", "act", "active_file" if has_active_file else "conversation"
     if contains_any(lower, coverage_words):
         if not contains_any(lower, run_words) or is_question:
             return "chat", "ask", "conversation"
@@ -758,11 +851,33 @@ def normalize_user_request(
     wants_file_info = bool(file_id) and any(token in lower for token in file_info_tokens)
     wants_code_context = bool(file_id) and any(token in lower for token in code_context_tokens)
     wants_coverage = any(token in lower for token in ["coverage", "jacoco", "覆盖率"])
+    wants_coverage_repair = any(token in lower for token in ("coverage", "jacoco", "提升覆盖率", "提高覆盖率", "覆盖率很低", "覆盖率低")) and any(
+        token in lower
+        for token in (
+            "repair",
+            "fix",
+            "improve",
+            "increase coverage",
+            "low coverage",
+            "提高",
+            "提升",
+            "覆盖率很低",
+            "覆盖率低",
+            "提升覆盖率",
+            "提高覆盖率",
+            "补测",
+            "补充测试",
+            "修复一下",
+        )
+    )
     wants_tool_history = any(token in lower for token in tool_history_tokens)
 
     if wants_tool_history:
         intent = "list_tool_history"
         mode = "read"
+    elif wants_coverage_repair and not is_question:
+        intent = "repair_low_coverage"
+        mode = "act"
     elif wants_coverage:
         if wants_run and not is_question:
             intent = "run_coverage"
@@ -928,6 +1043,7 @@ class AgentService:
         self,
         file_id: str | None,
         selected_file_ids: list[str] | None = None,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         selected_ids = [item for item in (selected_file_ids or []) if item]
         artifact_rows = (
@@ -992,6 +1108,14 @@ class AgentService:
                 }
                 for job in active_jobs
             ],
+            "conversation_state": {
+                "last_coverage": self.latest_conversation_coverage(conversation_id, file_id),
+                "recent_goals": [
+                    {"key": memory.key, "value": memory.value}
+                    for memory in self.conversation_memories(conversation_id)
+                    if memory.key.endswith(":last_goal")
+                ],
+            },
         }
 
     def route_user_request(
@@ -999,11 +1123,25 @@ class AgentService:
         message: str,
         file_id: str | None,
         selected_file_ids: list[str] | None = None,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
-        context = self.router_context(file_id, selected_file_ids)
+        context = self.router_context(file_id, selected_file_ids, conversation_id)
         fallback = normalize_user_request(message, file_id, selected_file_ids)
         fallback["route_context"] = context
-        if fallback.get("route_source") == "high_confidence_rules":
+        last_coverage = (context.get("conversation_state") or {}).get("last_coverage")
+        explicit_compile_issue = any(token in message.lower() for token in ("compile", "编译", "error", "报错", "运行失败"))
+        if fallback.get("intent") == "repair_latest" and last_coverage and not explicit_compile_issue:
+            fallback = normalized_request(
+                message,
+                file_id,
+                "repair_low_coverage",
+                "act",
+                route_source="conversation_memory",
+                router_reason="The latest scoped conversation state contains a JaCoCo coverage result; interpret this repair as coverage repair.",
+                target_scope="active_file" if file_id else "conversation",
+                route_context=context,
+            )
+        if fallback.get("route_source") in {"high_confidence_rules", "conversation_memory"}:
             return fallback
         if not settings.openai_api_key:
             return fallback
@@ -1024,8 +1162,10 @@ class AgentService:
             "5) Questions about FQN, imports, methods, Jimple, signatures, fields, helpers, or source structure route to ask_code_question/read. "
             "6) If the user asks to generate tests for selected files, use generate_selected_tests. "
             "7) If the user asks to generate tests for all missing project production sources, use generate_project_missing_tests. "
-            "8) Only use mode=act when the user clearly asks to execute a state-changing or resource-consuming action. "
-            "9) If unclear, choose chat/ask."
+            "8) If the user says coverage is low and asks to fix, improve, supplement, or raise coverage, use repair_low_coverage. "
+            "This means measure baseline coverage, generate a targeted test improvement, and verify coverage again; it is not ordinary compile repair. "
+            "9) Only use mode=act when the user clearly asks to execute a state-changing or resource-consuming action. "
+            "10) If unclear, choose chat/ask."
         )
         user = (
             f"Available intents:\n{intent_catalog}\n\n"
@@ -1091,10 +1231,107 @@ class AgentService:
     def memories(self) -> list[AgentMemory]:
         return (
             self.db.query(AgentMemory)
-            .filter(AgentMemory.user_id == self.user.id)
+            .filter(
+                AgentMemory.user_id == self.user.id,
+                ~AgentMemory.key.like("conversation:%"),
+            )
             .order_by(AgentMemory.updated_at.desc())
             .limit(20)
             .all()
+        )
+
+    def conversation_memories(self, conversation_id: str | None) -> list[AgentMemory]:
+        if not conversation_id:
+            return []
+        return (
+            self.db.query(AgentMemory)
+            .filter(
+                AgentMemory.user_id == self.user.id,
+                AgentMemory.key.like(f"conversation:{conversation_id}:%"),
+            )
+            .order_by(AgentMemory.updated_at.desc())
+            .limit(8)
+            .all()
+        )
+
+    def memory_prompt(self, conversation_id: str | None) -> str:
+        global_rows = self.memories()
+        conversation_rows = self.conversation_memories(conversation_id)
+        lines = [f"- {memory.key}: {memory.value}" for memory in global_rows]
+        lines.extend(f"- {memory.key}: {memory.value}" for memory in conversation_rows)
+        return "\n".join(lines)
+
+    def latest_conversation_coverage(self, conversation_id: str | None, file_id: str | None) -> dict[str, Any] | None:
+        if not conversation_id:
+            return None
+        row = (
+            self.db.query(AgentMemory)
+            .filter(
+                AgentMemory.user_id == self.user.id,
+                AgentMemory.key == f"conversation:{conversation_id}:last_coverage",
+            )
+            .one_or_none()
+        )
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row.value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if file_id and payload.get("file_id") and payload.get("file_id") != file_id:
+            return None
+        return payload
+
+    def auto_remember_interaction(
+        self,
+        conversation_id: str | None,
+        message: str,
+        normalized: dict[str, Any],
+        file_id: str | None,
+    ) -> None:
+        """Persist only stable preferences plus minimal scoped task state."""
+        if conversation_id:
+            self.remember(
+                f"conversation:{conversation_id}:last_goal",
+                json.dumps(
+                    {
+                        "intent": normalized.get("intent"),
+                        "scope": normalized.get("scope"),
+                        "canonical": normalized.get("canonical"),
+                        "file_id": file_id,
+                        "recorded_at": dt.datetime.utcnow().isoformat(),
+                    },
+                    ensure_ascii=False,
+                ),
+                "automatic-conversation-state",
+            )
+
+        compact_message = " ".join(message.strip().split())[:480]
+        lower = compact_message.lower()
+        sensitive = bool(re.search(r"(?:sk-[A-Za-z0-9_-]+|api[_ -]?key|password|secret|token)\s*[:=]", compact_message, re.IGNORECASE))
+        if not sensitive and any(marker in lower for marker in ("以后", "每次", "总是", "始终", "默认", "不要", "必须", "我希望", "我需要", "please always")):
+            fingerprint = hashlib.sha256(compact_message.encode("utf-8")).hexdigest()[:16]
+            self.remember(f"preference:{fingerprint}", compact_message, "automatic-preference")
+        if re.search(r"[\u4e00-\u9fff]", compact_message):
+            self.remember("preference:response_language", "zh-CN", "automatic-preference")
+
+    def remember_coverage_outcome(self, conversation_id: str | None, file_id: str, result: dict[str, Any]) -> None:
+        if not conversation_id:
+            return
+        artifact = result.get("artifact") if isinstance(result.get("artifact"), dict) else {}
+        payload = {
+            "file_id": file_id,
+            "artifact_id": artifact.get("id"),
+            "ok": bool(result.get("ok")),
+            "coverage": coverage_target_metrics(result.get("coverage")),
+            "recorded_at": dt.datetime.utcnow().isoformat(),
+        }
+        self.remember(
+            f"conversation:{conversation_id}:last_coverage",
+            json.dumps(payload, ensure_ascii=False),
+            "automatic-coverage-state",
         )
 
     def feedback_summary(self) -> str:
@@ -1767,6 +2004,8 @@ class AgentService:
         source = Path(file.storage_path).read_text(encoding="utf-8", errors="replace")
         compile_log = args.get("compile_log", "")
         instruction = args.get("instruction") or "Repair the generated JUnit 4 test so it is more likely to compile."
+        coverage_feedback = args.get("coverage") if isinstance(args.get("coverage"), dict) else None
+        repair_objective = "coverage_improvement" if coverage_feedback else "compile_or_runtime_repair"
         diagnosis = static_artifact_diagnosis(file.analysis, current_code, compile_log)
         model_used = ""
         prompt = ""
@@ -1782,6 +2021,7 @@ class AgentService:
                 source,
                 current_code,
                 code_context,
+                coverage_feedback=coverage_feedback,
             )
             prompt = rendered_prompt["user"]
             try:
@@ -1804,6 +2044,17 @@ class AgentService:
         else:
             repaired_code = deterministic_repair(file.analysis, current_code)
 
+        if repaired_code.strip() == current_code.strip():
+            return {
+                "ok": False,
+                "tool": "repair_artifact",
+                "artifact": artifact_summary(artifact),
+                "parent_artifact_id": artifact.id,
+                "reason": "The repair produced no code change, so no unverified duplicate artifact was saved.",
+                "diagnosis": diagnosis,
+                "repair_objective": repair_objective,
+            }
+
         class_name = file.analysis.get("class_name") or Path(file.original_name).stem
         artifact_dir = settings.storage_dir / "generated" / self.user.id / file.id
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -1821,6 +2072,8 @@ class AgentService:
             metadata_json={
                 "parent_artifact_id": artifact.id,
                 "instruction": instruction,
+                "repair_objective": repair_objective,
+                "coverage_baseline": coverage_target_metrics(coverage_feedback),
                 "diagnosis": diagnosis,
                 "sha256": hashlib.sha256(repaired_code.encode("utf-8")).hexdigest(),
                 "object_key": stored_object,
@@ -1841,16 +2094,23 @@ class AgentService:
             "used_model": bool(model_used),
             "diagnosis": diagnosis,
             "code_chars": len(repaired_code),
+            "repair_objective": repair_objective,
         }
 
     def latest_artifact_for_file(self, file_id: str) -> GeneratedArtifact | None:
         self._owned_file(file_id)
-        return (
+        artifacts = (
             self.db.query(GeneratedArtifact)
             .filter(GeneratedArtifact.user_id == self.user.id, GeneratedArtifact.file_id == file_id)
             .order_by(GeneratedArtifact.created_at.desc())
-            .first()
+            .all()
         )
+        for artifact in artifacts:
+            verification = (artifact.metadata_json or {}).get("coverage_verification")
+            if isinstance(verification, dict) and verification.get("improved") is False:
+                continue
+            return artifact
+        return artifacts[0] if artifacts else None
 
     def tool_read_memories(self, args: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -2264,6 +2524,218 @@ class AgentService:
         self.record_tool(conversation_id, name, args, compact)
         return compact
 
+    def coverage_repair_available(self, result: dict[str, Any]) -> bool:
+        line_metric = coverage_target_metrics(result.get("coverage")).get("line")
+        return bool(
+            result.get("ok")
+            and isinstance(line_metric, dict)
+            and isinstance(line_metric.get("total"), int)
+            and line_metric.get("total", 0) > 0
+        )
+
+    def persist_coverage_verification(
+        self,
+        candidate: GeneratedArtifact,
+        baseline: dict[str, Any],
+        after: dict[str, Any],
+    ) -> dict[str, Any]:
+        comparison = coverage_comparison(baseline.get("coverage"), after.get("coverage"))
+        metadata = dict(candidate.metadata_json or {})
+        metadata["coverage_verification"] = {
+            "baseline": comparison.get("before"),
+            "after": comparison.get("after"),
+            "changes": comparison.get("changes"),
+            "improved": comparison.get("improved"),
+            "verified_at": dt.datetime.utcnow().isoformat(),
+        }
+        candidate.metadata_json = metadata
+        self.db.add(candidate)
+        self.db.commit()
+        return comparison
+
+    def coverage_repair_reply(
+        self,
+        candidate: GeneratedArtifact,
+        comparison: dict[str, Any],
+    ) -> str:
+        metrics = coverage_comparison_text(comparison)
+        if comparison.get("improved"):
+            return (
+                f"覆盖率修复已完成并验证：`{Path(candidate.storage_path).name}`。\n\n"
+                f"{metrics}\n\n"
+                "该候选测试已成为当前文件后续覆盖率操作的优先版本。"
+            )
+        return (
+            f"已生成覆盖率修复候选：`{Path(candidate.storage_path).name}`，但二次 JaCoCo 验证没有提升目标类覆盖率。\n\n"
+            f"{metrics}\n\n"
+            "我保留候选供预览和下载，但不会把它当作当前文件的优先测试版本，也不会把这次操作宣称为修复成功。"
+        )
+
+    def repair_low_coverage(
+        self,
+        conversation_id: str | None,
+        file_id: str | None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        if not file_id:
+            return "请先选择一个生产 Java 文件，再执行覆盖率修复。", []
+        file = self._owned_file(file_id)
+        if is_uploaded_test_source(file):
+            result = self.test_source_tool_rejection("repair_low_coverage", file)
+            return "当前选中的是测试源码，不能把它作为覆盖率修复目标。请切换到生产源码。", [result]
+        latest = self.latest_artifact_for_file(file_id)
+        if latest is None:
+            result = self.tool_list_artifacts({"file_id": file_id})
+            return "当前生产源码还没有生成测试，无法先测量覆盖率并修复。", [result]
+
+        baseline = self.tool_run_coverage({"artifact_id": latest.id})
+        results: list[dict[str, Any]] = [baseline]
+        self.record_tool(conversation_id, "run_coverage", {"artifact_id": latest.id, "phase": "baseline"}, compact_tool_result(baseline))
+        self.remember_coverage_outcome(conversation_id, file_id, baseline)
+        if not self.coverage_repair_available(baseline):
+            diagnosis = self.tool_diagnose_artifact({"artifact_id": latest.id, "compile_log": baseline.get("output", "")})
+            results.append(diagnosis)
+            return "无法建立可用的目标类 JaCoCo 基线，因此没有生成无法验证效果的修复测试。请先解决覆盖率运行失败或目标类未识别问题。", results
+
+        diagnosis = self.tool_diagnose_artifact({"artifact_id": latest.id})
+        repaired = self.tool_repair_artifact(
+            {
+                "artifact_id": latest.id,
+                "instruction": coverage_repair_instruction(baseline.get("coverage")),
+                "coverage": baseline.get("coverage"),
+            }
+        )
+        results.extend([diagnosis, repaired])
+        self.record_tool(conversation_id, "diagnose_artifact", {"artifact_id": latest.id}, compact_tool_result(diagnosis))
+        self.record_tool(conversation_id, "repair_artifact", {"artifact_id": latest.id, "objective": "coverage_improvement"}, compact_tool_result(repaired))
+        candidate_id = (repaired.get("artifact") or {}).get("id")
+        if not repaired.get("ok") or not candidate_id:
+            return "已完成覆盖率诊断，但模型没有产出与原测试不同的可验证候选，因此未保存重复测试文件。", results
+
+        candidate = self._owned_artifact(candidate_id)
+        after = self.tool_run_coverage({"artifact_id": candidate.id})
+        results.append(after)
+        self.record_tool(conversation_id, "run_coverage", {"artifact_id": candidate.id, "phase": "verification"}, compact_tool_result(after))
+        self.remember_coverage_outcome(conversation_id, file_id, after)
+        if not self.coverage_repair_available(after):
+            metadata = dict(candidate.metadata_json or {})
+            metadata["coverage_verification"] = {
+                "improved": False,
+                "reason": "The candidate could not produce a comparable JaCoCo target report.",
+                "verified_at": dt.datetime.utcnow().isoformat(),
+            }
+            candidate.metadata_json = metadata
+            self.db.add(candidate)
+            self.db.commit()
+            return "覆盖率修复候选已生成，但它无法通过二次 JaCoCo 验证；候选已保留，且不会成为默认测试版本。", results
+        comparison = self.persist_coverage_verification(candidate, baseline, after)
+        return self.coverage_repair_reply(candidate, comparison), results
+
+    def coverage_events_for_artifact(
+        self,
+        artifact: GeneratedArtifact,
+        file: UploadedFile,
+        phase: str,
+        base_percent: int,
+    ) -> Iterator[dict[str, Any]]:
+        project_root = self.project_root_for_file(file)
+        if project_root and (project_root / "pom.xml").exists():
+            yield {"event": "status", "message": f"{base_percent}%：正在{phase} JaCoCo 覆盖率基线..."}
+            return (yield from self.run_maven_coverage_events(artifact, file, project_root))
+        yield {"event": "status", "message": f"{base_percent}%：正在{phase}本地 javac/JUnit/JaCoCo 覆盖率..."}
+        return self.tool_run_coverage({"artifact_id": artifact.id})
+
+    def low_coverage_repair_events(self, conversation_id: str, file_id: str | None) -> Iterator[dict[str, Any]]:
+        repair_skill = DEFAULT_SKILL_REGISTRY.for_intent("repair_low_coverage", "act").brief()
+        if not file_id:
+            reply = "请先选择一个生产 Java 文件，再执行覆盖率修复。"
+            for index in range(0, len(reply), 18):
+                yield {"event": "delta", "text": reply[index : index + 18]}
+            return
+        file = self._owned_file(file_id)
+        if is_uploaded_test_source(file):
+            result = self.test_source_tool_rejection("repair_low_coverage", file)
+            result["skill"] = repair_skill
+            yield {"event": "tool", "data": compact_tool_result(result)}
+            reply = "当前选中的是测试源码，不能把它作为覆盖率修复目标。请切换到生产源码。"
+            for index in range(0, len(reply), 18):
+                yield {"event": "delta", "text": reply[index : index + 18]}
+            return
+        latest = self.latest_artifact_for_file(file_id)
+        if latest is None:
+            result = self.tool_list_artifacts({"file_id": file_id})
+            result["skill"] = repair_skill
+            yield {"event": "tool", "data": compact_tool_result(result)}
+            reply = "当前生产源码还没有生成测试，无法先测量覆盖率并修复。"
+            for index in range(0, len(reply), 18):
+                yield {"event": "delta", "text": reply[index : index + 18]}
+            return
+
+        baseline = yield from self.coverage_events_for_artifact(latest, file, "测量", 10)
+        baseline["skill"] = repair_skill
+        compact_baseline = compact_tool_result(baseline)
+        self.record_tool(conversation_id, "run_coverage", {"artifact_id": latest.id, "phase": "baseline"}, compact_baseline)
+        self.remember_coverage_outcome(conversation_id, file_id, baseline)
+        yield {"event": "tool", "data": compact_baseline}
+        if not self.coverage_repair_available(baseline):
+            diagnosis = self.tool_diagnose_artifact({"artifact_id": latest.id, "compile_log": baseline.get("output", "")})
+            diagnosis["skill"] = repair_skill
+            compact_diagnosis = compact_tool_result(diagnosis)
+            self.record_tool(conversation_id, "diagnose_artifact", {"artifact_id": latest.id}, compact_diagnosis)
+            yield {"event": "tool", "data": compact_diagnosis}
+            reply = "无法建立可用的目标类 JaCoCo 基线，因此没有生成无法验证效果的修复测试。请先解决覆盖率运行失败或目标类未识别问题。"
+            for index in range(0, len(reply), 18):
+                yield {"event": "delta", "text": reply[index : index + 18]}
+            return
+
+        yield {"event": "status", "message": "60%：正在根据基线覆盖率、源码方法和现有测试生成定向补测..."}
+        diagnosis = self.tool_diagnose_artifact({"artifact_id": latest.id})
+        repaired = self.tool_repair_artifact(
+            {
+                "artifact_id": latest.id,
+                "instruction": coverage_repair_instruction(baseline.get("coverage")),
+                "coverage": baseline.get("coverage"),
+            }
+        )
+        for name, result, arguments in (
+            ("diagnose_artifact", diagnosis, {"artifact_id": latest.id}),
+            ("repair_artifact", repaired, {"artifact_id": latest.id, "objective": "coverage_improvement"}),
+        ):
+            result["skill"] = repair_skill
+            compact = compact_tool_result(result)
+            self.record_tool(conversation_id, name, arguments, compact)
+            yield {"event": "tool", "data": compact}
+        candidate_id = (repaired.get("artifact") or {}).get("id")
+        if not repaired.get("ok") or not candidate_id:
+            reply = "已完成覆盖率诊断，但模型没有产出与原测试不同的可验证候选，因此未保存重复测试文件。"
+            for index in range(0, len(reply), 18):
+                yield {"event": "delta", "text": reply[index : index + 18]}
+            return
+
+        candidate = self._owned_artifact(candidate_id)
+        after = yield from self.coverage_events_for_artifact(candidate, file, "验证修复后", 75)
+        after["skill"] = repair_skill
+        compact_after = compact_tool_result(after)
+        self.record_tool(conversation_id, "run_coverage", {"artifact_id": candidate.id, "phase": "verification"}, compact_after)
+        self.remember_coverage_outcome(conversation_id, file_id, after)
+        yield {"event": "tool", "data": compact_after}
+        if not self.coverage_repair_available(after):
+            metadata = dict(candidate.metadata_json or {})
+            metadata["coverage_verification"] = {
+                "improved": False,
+                "reason": "The candidate could not produce a comparable JaCoCo target report.",
+                "verified_at": dt.datetime.utcnow().isoformat(),
+            }
+            candidate.metadata_json = metadata
+            self.db.add(candidate)
+            self.db.commit()
+            reply = "覆盖率修复候选已生成，但它无法通过二次 JaCoCo 验证；候选已保留，且不会成为默认测试版本。"
+        else:
+            comparison = self.persist_coverage_verification(candidate, baseline, after)
+            reply = self.coverage_repair_reply(candidate, comparison)
+        yield {"event": "status", "message": "100%：覆盖率修复验证完成。"}
+        for index in range(0, len(reply), 18):
+            yield {"event": "delta", "text": reply[index : index + 18]}
+
     def scripted_chat(
         self,
         message: str,
@@ -2382,6 +2854,7 @@ class AgentService:
             else:
                 coverage_result = self.tool_run_coverage({"artifact_id": latest.id})
                 results.append(coverage_result)
+                self.remember_coverage_outcome(conversation_id, file_id, coverage_result)
                 if coverage_result.get("ok"):
                     reply = coverage_summary_text(coverage_result.get("coverage"))
                 else:
@@ -2404,6 +2877,9 @@ class AgentService:
                     reply = coverage_summary_text(results[-1].get("coverage"))
                 else:
                     reply = "覆盖率执行失败：" + str(results[-1].get("reason") or results[-1].get("output") or results[-1].get("stage"))
+        elif normalized["intent"] == "repair_low_coverage":
+            reply, repair_results = self.repair_low_coverage(conversation_id, file_id)
+            results.extend(repair_results)
         elif file_id and normalized["intent"] == "repair_latest":
             latest = self.latest_artifact_for_file(file_id)
             if latest is None:
@@ -2470,13 +2946,14 @@ class AgentService:
         history: list[dict[str, str]],
         selected_file_ids: list[str] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
-        normalized = self.route_user_request(message, file_id, selected_file_ids)
+        normalized = self.route_user_request(message, file_id, selected_file_ids, conversation_id)
+        self.auto_remember_interaction(conversation_id, message, normalized, file_id)
         if not settings.openai_api_key:
             return self.scripted_chat(message, file_id, selected_file_ids, conversation_id, normalized)
 
         if normalized["mode"] in {"act", "read"} or normalized["intent"] != "chat":
             return self.scripted_chat(message, file_id, selected_file_ids, conversation_id, normalized)
-        memory_text = "\n".join(f"- {memory.key}: {memory.value}" for memory in self.memories())
+        memory_text = self.memory_prompt(conversation_id)
         feedback_text = self.feedback_summary()
         system = (
             "你是一个可部署的 Java 测试生成 Agent。默认必须用中文回答。"
@@ -2603,6 +3080,7 @@ class AgentService:
         result.setdefault("skill", coverage_skill)
         compact = compact_tool_result(result)
         self.record_tool(conversation_id, "run_coverage", {"artifact_id": latest.id}, compact)
+        self.remember_coverage_outcome(conversation_id, file_id, result)
         yield {"event": "tool", "data": compact}
         if result.get("ok"):
             reply = coverage_summary_text(result.get("coverage"))
@@ -2619,11 +3097,15 @@ class AgentService:
         history: list[dict[str, str]],
         selected_file_ids: list[str] | None = None,
     ) -> Iterator[dict[str, Any]]:
-        normalized = self.route_user_request(message, file_id, selected_file_ids)
+        normalized = self.route_user_request(message, file_id, selected_file_ids, conversation_id)
+        self.auto_remember_interaction(conversation_id, message, normalized, file_id)
         yield {
             "event": "status",
             "message": f"识别为：{normalized.get('skill_id')} / {normalized.get('intent')} / {normalized.get('mode')}",
         }
+        if normalized["intent"] == "repair_low_coverage":
+            yield from self.low_coverage_repair_events(conversation_id, file_id)
+            return
         if normalized["intent"] in {"run_coverage", "run_single_coverage", "run_batch_coverage"}:
             if is_bulk_coverage_request(message, normalized, selected_file_ids):
                 yield {"event": "status", "message": "正在执行：识别覆盖率目标"}
@@ -2660,7 +3142,7 @@ class AgentService:
             for index in range(0, len(reply), 18):
                 yield {"event": "delta", "text": reply[index : index + 18]}
             return
-        memory_text = "\n".join(f"- {memory.key}: {memory.value}" for memory in self.memories())
+        memory_text = self.memory_prompt(conversation_id)
         feedback_text = self.feedback_summary()
         system = (
             "你是一个可部署的 Java 测试生成 Agent。默认必须用中文回答。"

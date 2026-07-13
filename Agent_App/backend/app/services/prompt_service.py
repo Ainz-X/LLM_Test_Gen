@@ -98,6 +98,7 @@ def render_repair_prompt(
     source: str,
     current_code: str,
     context: dict[str, Any],
+    coverage_feedback: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     template, path = load_prompt_template("repair")
     system = (
@@ -105,6 +106,16 @@ def render_repair_prompt(
         or "You repair Java JUnit 4 tests for uploaded source files. Return only compilable Java source code."
     )
     task = template.get("task") or "Repair the generated JUnit 4 test so it compiles and preserves useful assertions."
+    coverage_section = ""
+    if coverage_feedback:
+        coverage_section = (
+            "\n\nCoverage-improvement requirements:\n"
+            "- The previous test compiled and ran, but its JaCoCo coverage is insufficient.\n"
+            "- Add meaningful JUnit 4 cases that execute currently untested source behavior: boundary values, branches, exceptions, and distinct public API paths where applicable.\n"
+            "- Keep valid assertions; do not replace the test with placeholders or assertions that always pass.\n"
+            "- Return a complete replacement test class, not a diff.\n"
+            f"- Measured baseline:\n{json.dumps(coverage_feedback, ensure_ascii=False)}"
+        )
     user = (
         f"{task}\n\n"
         f"Instruction:\n{instruction}\n\n"
@@ -114,6 +125,7 @@ def render_repair_prompt(
         f"Compiler diagnostics:\n{truncate_text(compile_log or '<none>', 8000)}\n\n"
         f"Uploaded source:\n{truncate_text(source, 14000)}\n\n"
         f"Previous test code:\n{truncate_text(current_code, 14000)}"
+        f"{coverage_section}"
     )
     return {
         "system": system,
