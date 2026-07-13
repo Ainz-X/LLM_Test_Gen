@@ -22,6 +22,7 @@ from app.services import a3_tools
 from app.services.code_context_service import build_code_context, format_code_context_answer, infer_context_field
 from app.services.java_analysis import junit4_scaffold
 from app.services.prompt_service import render_generation_prompt, render_repair_prompt
+from app.services.react_tool_agent import ReactToolAgent
 from app.services.skills import DEFAULT_SKILL_REGISTRY
 from app.services.source_selection import file_source_name, is_uploaded_test_source, source_role_analysis, test_source_reason
 from app.services.storage_service import put_object
@@ -2157,6 +2158,18 @@ class AgentService:
     def tool_remember(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.remember(args["key"], args["value"], "user-request")
 
+    def tool_repair_low_coverage(self, args: dict[str, Any]) -> dict[str, Any]:
+        reply, steps = self.repair_low_coverage(
+            args.get("_conversation_id"),
+            args.get("file_id"),
+        )
+        return {
+            "ok": bool(steps),
+            "tool": "repair_low_coverage",
+            "reply": reply,
+            "steps": [compact_tool_result(step) for step in steps],
+        }
+
     def tools(self) -> dict[str, Any]:
         return {
             "list_skills": self.tool_list_skills,
@@ -2175,6 +2188,7 @@ class AgentService:
             "run_coverage": self.tool_run_coverage,
             "diagnose_artifact": self.tool_diagnose_artifact,
             "repair_artifact": self.tool_repair_artifact,
+            "repair_low_coverage": self.tool_repair_low_coverage,
             "read_memories": self.tool_read_memories,
             "list_tool_history": self.tool_list_tool_history,
             "remember": self.tool_remember,
@@ -2423,6 +2437,18 @@ class AgentService:
             {
                 "type": "function",
                 "function": {
+                    "name": "repair_low_coverage",
+                    "description": "Run the complete coverage-guided repair workflow for the active production Java file: establish a JaCoCo baseline, diagnose the latest generated test, create a targeted repair, then verify coverage again. Use when the user asks to fix, raise, improve, or supplement low coverage.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"file_id": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "read_memories",
                     "description": "Read remembered user/project preferences.",
                     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -2442,7 +2468,9 @@ class AgentService:
                 },
             },
         ]
-        return DEFAULT_SKILL_REGISTRY.filter_tool_schemas(schemas, skill_id)
+        # Skills document and audit workflows. They must not become a tool
+        # whitelist, otherwise one bad intent label turns an action into chat.
+        return schemas
 
     def run_tool_with_policy(
         self,
@@ -2456,6 +2484,10 @@ class AgentService:
     ) -> dict[str, Any]:
         if name in {"analyze_file", "read_code_context", "generate_tests", "list_artifacts"} and "file_id" not in args and file_id:
             args["file_id"] = file_id
+        if name == "repair_low_coverage":
+            if "file_id" not in args and file_id:
+                args["file_id"] = file_id
+            args["_conversation_id"] = conversation_id
         if name in {"read_artifact", "explain_artifact", "compile_artifact", "diagnose_artifact", "repair_artifact", "run_coverage"} and "artifact_id" not in args and file_id:
             latest = self.latest_artifact_for_file(file_id)
             if latest:
@@ -2480,21 +2512,13 @@ class AgentService:
             "run_coverage": 1,
             "diagnose_artifact": 1,
             "repair_artifact": 1,
+            "repair_low_coverage": 1,
             "read_memories": 1,
             "remember": 2,
         }
         call_counts[name] = call_counts.get(name, 0) + 1
         key = tool_call_key(name, args)
-        if skill_id and not DEFAULT_SKILL_REGISTRY.allows_tool(skill_id, name):
-            skill = DEFAULT_SKILL_REGISTRY.get(skill_id)
-            result = {
-                "ok": False,
-                "tool": name,
-                "blocked": True,
-                "skill": skill.brief(),
-                "reason": f"Tool `{name}` is outside the selected skill `{skill.id}`.",
-            }
-        elif key in seen_calls:
+        if key in seen_calls:
             result = {
                 "ok": False,
                 "tool": name,
@@ -2938,7 +2962,7 @@ class AgentService:
             compact_results.append(compact_tool_result(result))
         return reply, compact_results
 
-    def llm_chat(
+    def _legacy_llm_chat(
         self,
         conversation_id: str,
         message: str,
@@ -3089,7 +3113,7 @@ class AgentService:
         for index in range(0, len(reply), 18):
             yield {"event": "delta", "text": reply[index : index + 18]}
 
-    def llm_chat_events(
+    def _legacy_llm_chat_events(
         self,
         conversation_id: str,
         message: str,
@@ -3268,6 +3292,98 @@ class AgentService:
         limit_reply = "工具调用达到本轮上限。我已停止继续调用，请根据已返回的工具结果判断下一步。"
         for index in range(0, len(limit_reply), 18):
             yield {"event": "delta", "text": limit_reply[index : index + 18]}
+
+    def react_request_metadata(
+        self,
+        message: str,
+        file_id: str | None,
+        selected_file_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Minimal state for memory/audit; it does not decide tools or permissions."""
+        return {
+            "raw": message,
+            "language": "zh-CN",
+            "intent": "agentic_react",
+            "mode": "agent",
+            "side_effecting": False,
+            "scope": "selected_files" if selected_file_ids else ("active_file" if file_id else "conversation"),
+            "active_file_id": file_id,
+            "canonical": "The user's original message is the source of truth; choose tools in the ReAct loop.",
+            "skill_id": "agentic_react",
+            "allowed_tools": list(self.tools()),
+            "route_source": "langgraph_react",
+        }
+
+    def llm_chat(
+        self,
+        conversation_id: str,
+        message: str,
+        file_id: str | None,
+        history: list[dict[str, str]],
+        selected_file_ids: list[str] | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        if not settings.openai_api_key:
+            fallback = normalize_user_request(message, file_id, selected_file_ids)
+            self.auto_remember_interaction(conversation_id, message, fallback, file_id)
+            return self.scripted_chat(message, file_id, selected_file_ids, conversation_id, fallback)
+
+        metadata = self.react_request_metadata(message, file_id, selected_file_ids)
+        self.auto_remember_interaction(conversation_id, message, metadata, file_id)
+        try:
+            return ReactToolAgent(
+                self,
+                conversation_id,
+                message,
+                file_id,
+                history,
+                selected_file_ids,
+            ).run()
+        except Exception as exc:
+            fallback = normalize_user_request(message, file_id, selected_file_ids)
+            reply, tool_results = self.scripted_chat(message, file_id, selected_file_ids, conversation_id, fallback)
+            return f"LangGraph agent execution failed; local fallback was used.\n{reply}", [
+                {"ok": False, "tool": "langgraph_react", "error": f"{type(exc).__name__}: {exc}"},
+                *tool_results,
+            ]
+
+    def llm_chat_events(
+        self,
+        conversation_id: str,
+        message: str,
+        file_id: str | None,
+        history: list[dict[str, str]],
+        selected_file_ids: list[str] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        if not settings.openai_api_key:
+            fallback = normalize_user_request(message, file_id, selected_file_ids)
+            self.auto_remember_interaction(conversation_id, message, fallback, file_id)
+            reply, tool_results = self.scripted_chat(message, file_id, selected_file_ids, conversation_id, fallback)
+            for result in tool_results:
+                yield {"event": "tool", "data": result}
+            for offset in range(0, len(reply), 18):
+                yield {"event": "delta", "text": reply[offset : offset + 18]}
+            return
+
+        metadata = self.react_request_metadata(message, file_id, selected_file_ids)
+        self.auto_remember_interaction(conversation_id, message, metadata, file_id)
+        yield {"event": "status", "message": "正在理解请求并自主选择需要的工具…"}
+        try:
+            yield from ReactToolAgent(
+                self,
+                conversation_id,
+                message,
+                file_id,
+                history,
+                selected_file_ids,
+            ).stream()
+        except Exception as exc:
+            fallback = normalize_user_request(message, file_id, selected_file_ids)
+            reply, tool_results = self.scripted_chat(message, file_id, selected_file_ids, conversation_id, fallback)
+            yield {"event": "tool", "data": {"ok": False, "tool": "langgraph_react", "error": f"{type(exc).__name__}: {exc}"}}
+            for result in tool_results:
+                yield {"event": "tool", "data": result}
+            for offset in range(0, len(reply), 18):
+                yield {"event": "delta", "text": reply[offset : offset + 18]}
 
     def related_source_paths(self, file: UploadedFile) -> list[Path]:
         active_project_id = (file.analysis or {}).get("_project_id")
