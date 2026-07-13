@@ -1298,7 +1298,7 @@ function App() {
             <History size={16} />
             {text.history}
           </div>
-          <div className="scroll-list">
+          <div className={`scroll-list ${openConversationMenuId ? "menu-open" : ""}`}>
             {conversations.map((conversation) => (
               <div className="conversation-row" key={conversation.id}>
                 <button
