@@ -37,6 +37,8 @@ export type UploadedFile = {
 export type BatchGenerateResult = {
   ok?: boolean;
   generated_count?: number;
+  coverage_count?: number;
+  repaired_count?: number;
   failed_count?: number;
   skipped_count?: number;
   cancelled?: boolean;
@@ -58,6 +60,7 @@ export type Artifact = {
 
 export type AgentJob = {
   id: string;
+  idempotency_key?: string | null;
   kind: string;
   status: string;
   progress: number;
@@ -278,14 +281,16 @@ export function deleteUploadedFiles(fileIds: string[]) {
   });
 }
 
-export function generateTestsBatch(fileIds?: string[], onlyMissing = true) {
-  return request<BatchGenerateResult>("/files/generate/batch", {
+export function generateTestsBatch(fileIds?: string[], onlyMissing = true, idempotencyKey?: string) {
+  return request<AgentJob>("/files/generate/batch", {
     method: "POST",
+    headers: idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined,
     body: JSON.stringify({
       file_ids: fileIds && fileIds.length ? fileIds : undefined,
       only_missing: onlyMissing,
       max_files: 200,
-      goal: "Generate JUnit 4 tests for all selected Java files."
+      goal: "Generate JUnit 4 tests for all selected Java files.",
+      idempotency_key: idempotencyKey
     })
   });
 }

@@ -43,11 +43,11 @@ Rules:
    without changing state unless running a read-only inspection is needed.
 4. For questions about FQN, Jimple, signatures, methods, fields, imports, or
    helpers, use read_code_context or analyze_file rather than guessing.
-5. For a request to improve or repair low coverage, call repair_low_coverage.
-   It performs baseline coverage, diagnosis, targeted repair, and verification
-   as one audited workflow. Do not claim an improvement unless it was verified.
-6. For long-running or state-changing work, call one dependent tool at a time
-   and wait for its observation before deciding the next step.
+5. For coverage, JaCoCo, batch test generation, or low-coverage repair, start
+   the corresponding background job tool. It returns job_id immediately. Do
+   not run Maven or a multi-file repair synchronously in the chat request.
+6. Once a background job is submitted, tell the user it is running and rely on
+   the UI task progress stream. Do not poll or submit the same workload again.
 7. Never print a fake tool call, JSON action block, or an internal routing
    explanation to the user. Give a concise result after the tool work ends.
 """.strip()

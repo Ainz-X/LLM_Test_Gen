@@ -21,6 +21,7 @@ from app.models import AgentJob, AgentMemory, GeneratedArtifact, MessageFeedback
 from app.services import a3_tools
 from app.services.code_context_service import build_code_context, format_code_context_answer, infer_context_field
 from app.services.java_analysis import junit4_scaffold
+from app.services.job_service import JobSubmission, mark_queue_failure, submit_job
 from app.services.prompt_service import render_generation_prompt, render_repair_prompt
 from app.services.react_tool_agent import ReactToolAgent
 from app.services.skills import DEFAULT_SKILL_REGISTRY
@@ -1685,45 +1686,146 @@ class AgentService:
             )
         return {"ok": True, "tool": "list_files", "files": files, "count": len(files), "only_missing_tests": only_missing}
 
-    def tool_batch_generate_tests(self, args: dict[str, Any]) -> dict[str, Any]:
+    def _job_snapshot_scope(self, files: list[UploadedFile]) -> list[UploadedFile]:
+        """Capture every uploaded file in the affected project(s), not just targets."""
+        project_ids = {(file.analysis or {}).get("_project_id") for file in files}
+        project_ids.discard(None)
+        if not project_ids:
+            return files
+        return (
+            self.db.query(UploadedFile)
+            .filter(UploadedFile.user_id == self.user.id)
+            .all()
+            if not project_ids
+            else [
+                row
+                for row in self.db.query(UploadedFile).filter(UploadedFile.user_id == self.user.id).all()
+                if (row.analysis or {}).get("_project_id") in project_ids
+            ]
+        )
+
+    @staticmethod
+    def _job_view(submission: JobSubmission) -> dict[str, Any]:
+        job = submission.job
+        return {
+            "id": job.id,
+            "kind": job.kind,
+            "status": job.status,
+            "progress": job.progress,
+            "stage": job.stage,
+            "message": job.message,
+            "reused": submission.reused,
+            "idempotency_key": job.idempotency_key,
+        }
+
+    def _enqueue_background_job(self, submission: JobSubmission) -> JobSubmission:
+        if not submission.enqueue:
+            return submission
+        from app.tasks.agent_jobs import (
+            batch_generate_tests_task,
+            batch_repair_low_coverage_task,
+            batch_run_coverage_task,
+        )
+
+        task_for_kind = {
+            "batch_test_generation": batch_generate_tests_task,
+            "batch_coverage": batch_run_coverage_task,
+            "batch_low_coverage_repair": batch_repair_low_coverage_task,
+        }
+        try:
+            task = task_for_kind[submission.job.kind].delay(submission.job.id)
+            submission.job.external_id = task.id
+            self.db.commit()
+            self.db.refresh(submission.job)
+        except Exception as exc:
+            mark_queue_failure(self.db, submission.job, exc)
+            raise
+        return submission
+
+    def submit_batch_generation_job(self, args: dict[str, Any]) -> JobSubmission:
         goal = args.get("goal") or "Generate JUnit 4 tests for all selected Java files."
         selected, skipped, meta = self.batch_generation_plan(args)
-
-        generated: list[dict[str, Any]] = []
-        failed: list[dict[str, Any]] = []
-        for row in selected:
-            try:
-                result = self.tool_generate_tests({"file_id": row.id, "goal": goal})
-                generated.append(
-                    {
-                        "file_id": row.id,
-                        "file_name": row.original_name,
-                        "class_name": (row.analysis or {}).get("class_name"),
-                        "artifact_id": result.get("artifact_id"),
-                        "artifact_file": result.get("file_name"),
-                        "used_model": result.get("used_model"),
-                    }
-                )
-            except Exception as exc:
-                failed.append(
-                    {
-                        "file_id": row.id,
-                        "file_name": row.original_name,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-
-        return {
-            "ok": not failed,
-            "tool": "batch_generate_tests",
-            **meta,
-            "generated_count": len(generated),
-            "failed_count": len(failed),
-            "skipped_count": len(skipped),
-            "generated": generated,
-            "failed": failed,
-            "skipped": skipped[:50],
+        parameters = {
+            "only_missing": bool(args.get("only_missing", True)),
+            "max_files": max(1, min(int(args.get("max_files", 50)), 200)),
+            "goal": goal,
         }
+        submission = submit_job(
+            self.db,
+            user=self.user,
+            kind="batch_test_generation",
+            files=selected,
+            snapshot_files=self._job_snapshot_scope(selected),
+            request={"goal": goal, "initial_skipped": skipped, **meta},
+            parameters=parameters,
+            force=bool(args.get("force", False)),
+            client_key=args.get("idempotency_key"),
+        )
+        return self._enqueue_background_job(submission)
+
+    def _coverage_targets(self, args: dict[str, Any]) -> tuple[list[UploadedFile], list[dict[str, Any]], list[dict[str, str]]]:
+        selected, skipped, _ = self.batch_generation_plan(
+            {"file_ids": args.get("file_ids") or [], "only_missing": False, "max_files": args.get("max_files", 50)}
+        )
+        targets: list[dict[str, str]] = []
+        for row in selected:
+            artifact = self.latest_artifact_for_file(row.id)
+            if artifact is None:
+                skipped.append({"file_id": row.id, "name": row.original_name, "reason": "no_generated_test"})
+                continue
+            targets.append({"file_id": row.id, "artifact_id": artifact.id, "file_name": row.original_name})
+        return selected, skipped, targets
+
+    def submit_coverage_job(self, args: dict[str, Any]) -> JobSubmission:
+        selected, skipped, targets = self._coverage_targets(args)
+        parameters = {"max_files": max(1, min(int(args.get("max_files", 50)), 200)), "operation": "coverage"}
+        submission = submit_job(
+            self.db,
+            user=self.user,
+            kind="batch_coverage",
+            files=selected,
+            snapshot_files=self._job_snapshot_scope(selected),
+            request={"targets": targets, "initial_skipped": skipped},
+            parameters=parameters,
+            force=bool(args.get("force", False)),
+            client_key=args.get("idempotency_key"),
+        )
+        return self._enqueue_background_job(submission)
+
+    def submit_low_coverage_repair_job(self, args: dict[str, Any]) -> JobSubmission:
+        selected, skipped, targets = self._coverage_targets(args)
+        parameters = {"max_files": max(1, min(int(args.get("max_files", 50)), 200)), "operation": "low_coverage_repair"}
+        submission = submit_job(
+            self.db,
+            user=self.user,
+            kind="batch_low_coverage_repair",
+            files=selected,
+            snapshot_files=self._job_snapshot_scope(selected),
+            request={"targets": targets, "initial_skipped": skipped},
+            parameters=parameters,
+            force=bool(args.get("force", False)),
+            client_key=args.get("idempotency_key"),
+        )
+        return self._enqueue_background_job(submission)
+
+    def tool_batch_generate_tests(self, args: dict[str, Any]) -> dict[str, Any]:
+        submission = self.submit_batch_generation_job(args)
+        return {
+            "ok": True,
+            "tool": "batch_generate_tests",
+            "job_id": submission.job.id,
+            "job": self._job_view(submission),
+            "file_ids": list((submission.job.request_json or {}).get("target_file_ids") or []),
+            "reused": submission.reused,
+        }
+
+    def tool_start_coverage_job(self, args: dict[str, Any]) -> dict[str, Any]:
+        submission = self.submit_coverage_job(args)
+        return {"ok": True, "tool": "start_coverage_job", "job_id": submission.job.id, "job": self._job_view(submission), "file_ids": list((submission.job.request_json or {}).get("target_file_ids") or []), "reused": submission.reused}
+
+    def tool_start_low_coverage_repair_job(self, args: dict[str, Any]) -> dict[str, Any]:
+        submission = self.submit_low_coverage_repair_job(args)
+        return {"ok": True, "tool": "start_low_coverage_repair_job", "job_id": submission.job.id, "job": self._job_view(submission), "file_ids": list((submission.job.request_json or {}).get("target_file_ids") or []), "reused": submission.reused}
 
     def tool_list_artifacts(self, args: dict[str, Any]) -> dict[str, Any]:
         limit = max(1, min(int(args.get("limit", 10)), 50))
@@ -2162,6 +2264,7 @@ class AgentService:
         reply, steps = self.repair_low_coverage(
             args.get("_conversation_id"),
             args.get("file_id"),
+            args.get("artifact_id"),
         )
         return {
             "ok": bool(steps),
@@ -2181,6 +2284,8 @@ class AgentService:
             "read_code_context": self.tool_read_code_context,
             "generate_tests": self.tool_generate_tests,
             "batch_generate_tests": self.tool_batch_generate_tests,
+            "start_coverage_job": self.tool_start_coverage_job,
+            "start_low_coverage_repair_job": self.tool_start_low_coverage_repair_job,
             "list_artifacts": self.tool_list_artifacts,
             "read_artifact": self.tool_read_artifact,
             "explain_artifact": self.tool_explain_artifact,
@@ -2314,7 +2419,7 @@ class AgentService:
                 "type": "function",
                 "function": {
                     "name": "batch_generate_tests",
-                    "description": "Generate JUnit 4 test artifacts for many uploaded Java files in one tool call. Use this when the user asks to generate tests for all files, all missing tests, or batch-generate tests.",
+                    "description": "Submit a cancellable background job that generates JUnit 4 test artifacts for many uploaded Java files. Returns job_id immediately. Use this when the user asks to generate tests for all files, all missing tests, or batch-generate tests.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -2394,12 +2499,15 @@ class AgentService:
             {
                 "type": "function",
                 "function": {
-                    "name": "run_coverage",
-                    "description": "Compile the active source plus related uploaded files, run the generated JUnit 4 artifact, and collect JaCoCo coverage. Use only when the user explicitly asks for coverage, JaCoCo, running tests, or exact percentages.",
+                    "name": "start_coverage_job",
+                    "description": "Start a cancellable background JaCoCo coverage job for one or many production Java files. Returns job_id immediately. Use for coverage, JaCoCo, or running generated tests; never wait for Maven inside the chat request.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"artifact_id": {"type": "string"}},
-                        "required": ["artifact_id"],
+                        "properties": {
+                            "file_ids": {"type": "array", "items": {"type": "string"}},
+                            "max_files": {"type": "integer"},
+                            "force": {"type": "boolean"},
+                        },
                         "additionalProperties": False,
                     },
                 },
@@ -2437,11 +2545,15 @@ class AgentService:
             {
                 "type": "function",
                 "function": {
-                    "name": "repair_low_coverage",
-                    "description": "Run the complete coverage-guided repair workflow for the active production Java file: establish a JaCoCo baseline, diagnose the latest generated test, create a targeted repair, then verify coverage again. Use when the user asks to fix, raise, improve, or supplement low coverage.",
+                    "name": "start_low_coverage_repair_job",
+                    "description": "Start a cancellable background coverage-guided repair job. It establishes JaCoCo baselines, diagnoses tests, creates repair candidates, and verifies them. Returns job_id immediately; use for requests to fix, raise, improve, or supplement low coverage.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"file_id": {"type": "string"}},
+                        "properties": {
+                            "file_ids": {"type": "array", "items": {"type": "string"}},
+                            "max_files": {"type": "integer"},
+                            "force": {"type": "boolean"},
+                        },
                         "additionalProperties": False,
                     },
                 },
@@ -2484,10 +2596,13 @@ class AgentService:
     ) -> dict[str, Any]:
         if name in {"analyze_file", "read_code_context", "generate_tests", "list_artifacts"} and "file_id" not in args and file_id:
             args["file_id"] = file_id
-        if name == "repair_low_coverage":
-            if "file_id" not in args and file_id:
-                args["file_id"] = file_id
-            args["_conversation_id"] = conversation_id
+        if name in {"repair_low_coverage", "start_low_coverage_repair_job", "start_coverage_job"}:
+            if file_id and "file_id" not in args and "file_ids" not in args:
+                args["file_ids"] = [file_id]
+            if name == "repair_low_coverage":
+                if "file_id" not in args and file_id:
+                    args["file_id"] = file_id
+                args["_conversation_id"] = conversation_id
         if name in {"read_artifact", "explain_artifact", "compile_artifact", "diagnose_artifact", "repair_artifact", "run_coverage"} and "artifact_id" not in args and file_id:
             latest = self.latest_artifact_for_file(file_id)
             if latest:
@@ -2505,6 +2620,8 @@ class AgentService:
             "read_code_context": 1,
             "generate_tests": 1,
             "batch_generate_tests": 1,
+            "start_coverage_job": 1,
+            "start_low_coverage_repair_job": 1,
             "list_artifacts": 1,
             "read_artifact": 1,
             "explain_artifact": 1,
@@ -2599,6 +2716,7 @@ class AgentService:
         self,
         conversation_id: str | None,
         file_id: str | None,
+        artifact_id: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         if not file_id:
             return "请先选择一个生产 Java 文件，再执行覆盖率修复。", []
@@ -2606,7 +2724,9 @@ class AgentService:
         if is_uploaded_test_source(file):
             result = self.test_source_tool_rejection("repair_low_coverage", file)
             return "当前选中的是测试源码，不能把它作为覆盖率修复目标。请切换到生产源码。", [result]
-        latest = self.latest_artifact_for_file(file_id)
+        latest = self._owned_artifact(artifact_id) if artifact_id else self.latest_artifact_for_file(file_id)
+        if latest is not None and latest.file_id != file_id:
+            return "The selected generated test does not belong to the selected Java file.", []
         if latest is None:
             result = self.tool_list_artifacts({"file_id": file_id})
             return "当前生产源码还没有生成测试，无法先测量覆盖率并修复。", [result]

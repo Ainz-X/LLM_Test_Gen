@@ -72,9 +72,15 @@ class UploadedFile(Base):
 
 class AgentJob(Base):
     __tablename__ = "agent_jobs"
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_agent_job_user_idempotency"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    # A deterministic workload fingerprint. NULL keeps pre-existing jobs and
+    # manually created jobs compatible with the migration.
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     kind: Mapped[str] = mapped_column(String(80), index=True)
     status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
     progress: Mapped[int] = mapped_column(Integer, default=0)

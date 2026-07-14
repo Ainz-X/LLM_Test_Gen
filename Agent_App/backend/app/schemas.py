@@ -117,16 +117,29 @@ class BatchGenerateIn(BaseModel):
     only_missing: bool = True
     max_files: int = Field(default=50, ge=1, le=200)
     goal: str = "Generate JUnit 4 tests for all selected Java files."
-    job_id: str | None = None
+    # The client key protects retried HTTP submissions. The server additionally
+    # derives a workload key from the project snapshot and operation parameters.
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
+    force: bool = False
+
+
+class BatchCoverageIn(BaseModel):
+    file_ids: list[str] | None = None
+    max_files: int = Field(default=50, ge=1, le=200)
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
+    force: bool = False
 
 
 class ContextExtractIn(BaseModel):
     file_ids: list[str] | None = None
     project_id: str | None = None
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
+    force: bool = False
 
 
 class AgentJobOut(BaseModel):
     id: str
+    idempotency_key: str | None = None
     kind: str
     status: str
     progress: int

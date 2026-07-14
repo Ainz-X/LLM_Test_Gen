@@ -39,6 +39,7 @@ import {
   downloadArtifactsZip,
   exportConversation,
   extractCodeContext,
+  generateTestsBatch,
   getArtifacts,
   getConversations,
   getFiles,
@@ -119,7 +120,7 @@ const suggestions = [
 type TaskModalState = {
   open: boolean;
   running: boolean;
-  kind?: "upload" | "generate" | "context";
+  kind?: "upload" | "generate" | "context" | "coverage" | "repair";
   title: string;
   detail: string;
   progress: number;
@@ -419,6 +420,7 @@ function App() {
   const chatAbortRefs = useRef<Record<string, AbortController>>({});
   const batchAbortRef = useRef<{ controller: AbortController; jobId: string } | null>(null);
   const contextAbortRef = useRef<{ controller: AbortController; jobId: string } | null>(null);
+  const trackedJobIds = useRef<Set<string>>(new Set());
 
   const activeFile = useMemo(() => files.find((file) => file.id === activeFileId), [files, activeFileId]);
   const rawMessages = conversationId ? messagesByConversation[conversationId] || [] : [];
@@ -642,6 +644,91 @@ function App() {
       });
       return;
     }
+    // Long batch work is submitted first, then observed through the durable
+    // AgentJob stream. The legacy synchronous SSE code below remains only for
+    // backward compatibility with an older backend during rolling upgrades.
+    {
+      const requestKey =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `batch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const controller = new AbortController();
+      setBusy(true);
+      setStatus(title);
+      try {
+        const job = await generateTestsBatch(targetIds, onlyMissing, requestKey);
+        batchAbortRef.current = { controller, jobId: job.id };
+        setTaskModal({
+          open: true,
+          running: !["succeeded", "failed", "cancelled"].includes(job.status),
+          kind: "generate",
+          title,
+          detail: job.message || "Batch job queued.",
+          progress: Number(job.progress || 0),
+          indeterminate: false,
+          cancelled: job.status === "cancelled",
+          jobId: job.id,
+          files: targetFiles,
+          rejected: []
+        });
+        let finalJob: AgentJob | undefined;
+        await streamJob(
+          job.id,
+          {
+            onProgress: (next) => {
+              setStatus(next.message || title);
+              setTaskModal((current) => ({
+                ...current,
+                progress: Math.max(0, Math.min(100, Number(next.progress || 0))),
+                detail: next.message || current.detail,
+                currentItem: next.message || current.currentItem
+              }));
+            },
+            onDone: (done) => {
+              finalJob = done;
+              const result = (done.result_json || {}) as BatchGenerateResult;
+              setTaskModal((current) => ({
+                ...current,
+                running: false,
+                cancelled: done.status === "cancelled",
+                progress: 100,
+                detail: done.error || done.message || "Batch job finished.",
+                currentItem: "",
+                result
+              }));
+            },
+            onError: (error) => {
+              throw new Error(String(error.detail || "Batch job stream failed."));
+            }
+          },
+          controller.signal
+        );
+        const result = (finalJob?.result_json || {}) as BatchGenerateResult;
+        if (conversationId) {
+          setConversationMessages(conversationId, (current) => [
+            ...current,
+            {
+              id: `local-batch-${Date.now()}`,
+              role: "assistant",
+              content: finalJob?.status === "cancelled" ? "Batch generation was cancelled." : "Batch generation finished.",
+              tool_results: { items: [result] },
+              created_at: new Date().toISOString()
+            }
+          ]);
+        }
+        await Promise.all([refresh(), activeFileId ? getArtifacts(activeFileId).then(setArtifacts) : Promise.resolve()]);
+      } catch (err) {
+        if (!(err instanceof DOMException && err.name === "AbortError")) {
+          setTaskModal((current) => ({ ...current, running: false, progress: 100, detail: err instanceof Error ? err.message : "Batch job failed." }));
+        }
+      } finally {
+        if (batchAbortRef.current?.jobId) batchAbortRef.current = null;
+        setBusy(false);
+        setStatus("");
+      }
+      return;
+    }
+
     const jobId =
       typeof crypto !== "undefined" && "randomUUID" in crypto
         ? crypto.randomUUID()
@@ -785,8 +872,9 @@ function App() {
         currentItem: "",
         result: displayResult
       }));
-      if (conversationId) {
-        setConversationMessages(conversationId, (current) => [
+      const completedConversationId = conversationId;
+      if (completedConversationId) {
+        setConversationMessages(completedConversationId!, (current) => [
           ...current,
           {
             id: `local-batch-${Date.now()}`,
@@ -799,9 +887,11 @@ function App() {
           }
         ]);
       }
-      await Promise.all([refresh(), activeFileId ? getArtifacts(activeFileId).then(setArtifacts) : Promise.resolve()]);
+      const completedFileId = activeFileId;
+      await Promise.all([refresh(), completedFileId ? getArtifacts(completedFileId!).then(setArtifacts) : Promise.resolve()]);
     } catch (err) {
-      if (err instanceof DOMException && err.name === "AbortError") {
+      const error = err as Error;
+      if (error.name === "AbortError") {
         setTaskModal((current) => ({
           ...current,
           running: false,
@@ -949,6 +1039,68 @@ function App() {
     }
   }
 
+  async function trackAgentJobFromTool(payload: Record<string, unknown>) {
+    const job = payload.job as AgentJob | undefined;
+    if (!job?.id || job.kind === "code_context_extraction") {
+      return trackContextJobFromTool(payload);
+    }
+    if (!new Set(["batch_test_generation", "batch_coverage", "batch_low_coverage_repair"]).has(job.kind)) return;
+    if (trackedJobIds.current.has(job.id)) return;
+    trackedJobIds.current.add(job.id);
+    const fileIds = Array.isArray(payload.file_ids) ? payload.file_ids.map(String) : [];
+    const controller = new AbortController();
+    batchAbortRef.current = { controller, jobId: job.id };
+    const kind = job.kind === "batch_coverage" ? "coverage" : job.kind === "batch_low_coverage_repair" ? "repair" : "generate";
+    const title = kind === "coverage" ? "JaCoCo coverage job" : kind === "repair" ? "Low coverage repair job" : "Batch test generation";
+    setTaskModal({
+      open: true,
+      running: !["succeeded", "failed", "cancelled"].includes(job.status),
+      kind,
+      title,
+      detail: job.message || "Background job queued.",
+      progress: Number(job.progress || 0),
+      indeterminate: false,
+      cancelled: job.status === "cancelled",
+      jobId: job.id,
+      files: files.filter((file) => fileIds.includes(file.id)),
+      rejected: []
+    });
+    try {
+      await streamJob(
+        job.id,
+        {
+          onProgress: (next) => {
+            setTaskModal((current) => ({
+              ...current,
+              progress: Math.max(0, Math.min(100, Number(next.progress || 0))),
+              detail: next.message || current.detail,
+              currentItem: next.message || current.currentItem
+            }));
+          },
+          onDone: (done) => {
+            setTaskModal((current) => ({
+              ...current,
+              running: false,
+              cancelled: done.status === "cancelled",
+              progress: 100,
+              detail: done.error || done.message || "Background job finished.",
+              currentItem: "",
+              result: (done.result_json || {}) as BatchGenerateResult
+            }));
+            Promise.all([refresh(), activeFileId ? getArtifacts(activeFileId).then(setArtifacts) : Promise.resolve()]).catch(console.error);
+          },
+          onError: (error) => {
+            setTaskModal((current) => ({ ...current, running: false, progress: 100, detail: String(error.detail || "Background job stream failed.") }));
+          }
+        },
+        controller.signal
+      );
+    } finally {
+      trackedJobIds.current.delete(job.id);
+      if (batchAbortRef.current?.jobId === job.id) batchAbortRef.current = null;
+    }
+  }
+
   async function trackContextJobFromTool(payload: Record<string, unknown>) {
     if (payload.tool !== "extract_code_context") return;
     const job = payload.job as AgentJob | undefined;
@@ -1087,7 +1239,7 @@ function App() {
                 : item
             )
           );
-          trackContextJobFromTool(payload).catch(console.error);
+          trackAgentJobFromTool(payload).catch(console.error);
         },
         onDelta: (chunk) => {
           setConversationMessages(targetConversationId, (current) =>
@@ -1200,7 +1352,7 @@ function App() {
   async function cancelCurrentWork() {
     const batch = batchAbortRef.current;
     if (batch) {
-      cancelBatchGenerate(batch.jobId).catch(console.error);
+      cancelJob(batch.jobId).catch(console.error);
       batch.controller.abort();
       setTaskModal((current) =>
         current.open && current.running
@@ -1679,11 +1831,21 @@ function App() {
 
               {taskModal.result && (
                 <section className="task-panel">
-                  <div className="section-title">{taskModal.kind === "context" ? "提取结果" : "生成结果"}</div>
+                  <div className="section-title">{taskModal.kind === "context" ? "提取结果" : taskModal.kind === "coverage" ? "覆盖率结果" : taskModal.kind === "repair" ? "修复结果" : "生成结果"}</div>
                   {taskModal.kind === "context" ? (
                     <div className="result-grid">
                       <div><strong>{taskModal.result.file_count || 0}</strong><span>文件</span></div>
                       <div><strong>{taskModal.result.context_rows || 0}</strong><span>上下文行</span></div>
+                      <div><strong>{taskModal.result.failed_count || 0}</strong><span>失败</span></div>
+                    </div>
+                  ) : taskModal.kind === "coverage" ? (
+                    <div className="result-grid">
+                      <div><strong>{taskModal.result.coverage_count || 0}</strong><span>已完成</span></div>
+                      <div><strong>{taskModal.result.failed_count || 0}</strong><span>失败</span></div>
+                    </div>
+                  ) : taskModal.kind === "repair" ? (
+                    <div className="result-grid">
+                      <div><strong>{taskModal.result.repaired_count || 0}</strong><span>已处理</span></div>
                       <div><strong>{taskModal.result.failed_count || 0}</strong><span>失败</span></div>
                     </div>
                   ) : (

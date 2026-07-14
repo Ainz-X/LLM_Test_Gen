@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 import anyio
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -23,6 +23,7 @@ from app.schemas import (
     ArtifactReadOut,
     BatchFileDeleteIn,
     BatchFileDeleteOut,
+    BatchCoverageIn,
     BatchGenerateIn,
     BatchUploadOut,
     ContextExtractIn,
@@ -30,6 +31,7 @@ from app.schemas import (
 )
 from app.security import get_current_user
 from app.services.agent_service import AgentService, GenerationCancelled
+from app.services.job_service import mark_queue_failure, submit_job
 from app.services.java_analysis import analyze_java_source
 from app.services.source_selection import file_source_name, source_role_analysis
 from app.services.storage_service import put_object, remove_object
@@ -59,6 +61,7 @@ def sse(event: str, data: dict) -> str:
 def job_payload(job: AgentJob) -> dict[str, object]:
     return {
         "id": job.id,
+        "idempotency_key": job.idempotency_key,
         "kind": job.kind,
         "status": job.status,
         "progress": job.progress,
@@ -499,21 +502,61 @@ def delete_files_batch(
     return BatchFileDeleteOut(ok=not not_found, deleted_file_ids=deleted, deleted_artifacts=artifact_count, not_found=not_found)
 
 
-@router.post("/generate/batch")
+@router.post("/generate/batch", response_model=AgentJobOut)
 def generate_tests_batch(
     payload: BatchGenerateIn,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    request_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
     service = AgentService(db, user)
-    return service.tool_batch_generate_tests(
+    submission = service.submit_batch_generation_job(
         {
             "file_ids": payload.file_ids or [],
             "only_missing": payload.only_missing,
             "max_files": payload.max_files,
             "goal": payload.goal,
+            "force": payload.force,
+            "idempotency_key": payload.idempotency_key or request_key,
         }
     )
+    return submission.job
+
+
+@router.post("/coverage/batch", response_model=AgentJobOut)
+def run_coverage_batch(
+    payload: BatchCoverageIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    request_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    submission = AgentService(db, user).submit_coverage_job(
+        {
+            "file_ids": payload.file_ids or [],
+            "max_files": payload.max_files,
+            "force": payload.force,
+            "idempotency_key": payload.idempotency_key or request_key,
+        }
+    )
+    return submission.job
+
+
+@router.post("/repair/low-coverage/batch", response_model=AgentJobOut)
+def repair_low_coverage_batch(
+    payload: BatchCoverageIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    request_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    submission = AgentService(db, user).submit_low_coverage_repair_job(
+        {
+            "file_ids": payload.file_ids or [],
+            "max_files": payload.max_files,
+            "force": payload.force,
+            "idempotency_key": payload.idempotency_key or request_key,
+        }
+    )
+    return submission.job
 
 
 @router.post("/generate/batch/{job_id}/cancel")
@@ -530,7 +573,7 @@ def generate_tests_batch_stream(
     user: User = Depends(get_current_user),
 ):
     service = AgentService(db, user)
-    job_id = payload.job_id or uuid.uuid4().hex
+    job_id = uuid.uuid4().hex
     cancel_key = f"{user.id}:{job_id}"
     CANCELLED_BATCH_JOBS.discard(cancel_key)
 

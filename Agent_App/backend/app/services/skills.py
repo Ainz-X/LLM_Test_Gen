@@ -150,7 +150,7 @@ DEFAULT_SKILL_REGISTRY = SkillRegistry(
         AgentSkill(
             id="test_generation",
             label="Test generation",
-            summary="Create one or many JUnit 4 test artifacts from uploaded Java sources and extracted context.",
+            summary="Create one JUnit test immediately or submit a durable batch-generation job for many uploaded Java sources.",
             tools=("generate_tests", "batch_generate_tests"),
             intents=("generate_tests", "batch_generate_tests", "generate_selected_tests", "generate_project_missing_tests"),
             read_only=False,
@@ -160,8 +160,8 @@ DEFAULT_SKILL_REGISTRY = SkillRegistry(
         AgentSkill(
             id="coverage_analysis",
             label="Coverage analysis",
-            summary="Compile, run JUnit, and collect JaCoCo coverage for generated artifacts.",
-            tools=("list_artifacts", "compile_artifact", "run_coverage"),
+            summary="Submit durable JaCoCo coverage work and inspect generated artifacts without blocking a chat request.",
+            tools=("list_artifacts", "compile_artifact", "start_coverage_job"),
             intents=("run_coverage", "run_single_coverage", "run_batch_coverage", "_legacy_run_coverage"),
             read_only=False,
             side_effecting=True,
@@ -170,8 +170,8 @@ DEFAULT_SKILL_REGISTRY = SkillRegistry(
         AgentSkill(
             id="coverage_repair",
             label="Coverage-guided test repair",
-            summary="Measure JaCoCo coverage, create a targeted improved test, then verify whether coverage actually increased.",
-            tools=("list_artifacts", "run_coverage", "diagnose_artifact", "repair_artifact", "repair_low_coverage"),
+            summary="Submit coverage-guided repair work, then verify whether JaCoCo coverage actually increased.",
+            tools=("list_artifacts", "start_low_coverage_repair_job"),
             intents=("repair_low_coverage",),
             read_only=False,
             side_effecting=True,
