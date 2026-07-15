@@ -174,8 +174,21 @@ def safe_zip_entries(archive: zipfile.ZipFile) -> tuple[list[tuple[zipfile.ZipIn
     entries: list[tuple[zipfile.ZipInfo, Path, str]] = []
     rejected: list[dict[str, str]] = []
     seen: set[str] = set()
+    infos = archive.infolist()
+    if len(infos) > settings.max_project_archive_entries:
+        return [], [{"name": "archive", "reason": f"archive has more than {settings.max_project_archive_entries} entries"}]
+    unpacked_bytes = 0
     for info in archive.infolist():
         if info.is_dir() or should_skip_zip_member(info.filename):
+            continue
+        if ((info.external_attr >> 16) & 0o170000) == 0o120000:
+            rejected.append({"name": info.filename, "reason": "symbolic links are not allowed"})
+            continue
+        unpacked_bytes += info.file_size
+        if unpacked_bytes > settings.max_project_unpacked_bytes:
+            return [], [{"name": "archive", "reason": f"archive unpacks beyond {settings.max_project_unpacked_bytes} bytes"}]
+        if info.file_size and (not info.compress_size or info.file_size / info.compress_size > settings.max_project_compression_ratio):
+            rejected.append({"name": info.filename, "reason": "compression ratio exceeds limit"})
             continue
         if Path(info.filename).is_absolute() or ".." in Path(info.filename).parts:
             rejected.append({"name": info.filename, "reason": "unsafe zip path"})
@@ -377,6 +390,8 @@ def persist_project_archive(name: str, archive: zipfile.ZipFile, db: Session, us
 
 
 def persist_project_zip(name: str, content: bytes, db: Session, user: User) -> tuple[list[UploadedFile], list[dict[str, str]]]:
+    if len(content) > settings.max_project_archive_bytes:
+        return [], [{"name": name, "reason": f"archive exceeds {settings.max_project_archive_bytes} byte upload limit"}]
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
             return persist_project_archive(name, archive, db, user)
@@ -386,6 +401,10 @@ def persist_project_zip(name: str, content: bytes, db: Session, user: User) -> t
 
 def persist_project_zip_file(name: str, file_obj: BinaryIO, db: Session, user: User) -> tuple[list[UploadedFile], list[dict[str, str]]]:
     try:
+        file_obj.seek(0)
+        file_obj.seek(0, 2)
+        if file_obj.tell() > settings.max_project_archive_bytes:
+            return [], [{"name": name, "reason": f"archive exceeds {settings.max_project_archive_bytes} byte upload limit"}]
         file_obj.seek(0)
         with zipfile.ZipFile(file_obj) as archive:
             return persist_project_archive(name, archive, db, user)
@@ -435,6 +454,8 @@ def upload_java(
     if not name.endswith(".java"):
         raise HTTPException(status_code=400, detail="Only .java files are supported")
     content = file.file.read()
+    if len(content) > settings.max_project_archive_bytes:
+        raise HTTPException(status_code=413, detail="Java source exceeds upload size limit")
     record = persist_java(name, content, db, user)
     db.commit()
     db.refresh(record)
@@ -459,6 +480,9 @@ def upload_batch(
             continue
 
         content = file.file.read()
+        if len(content) > settings.max_project_archive_bytes:
+            rejected.append({"name": raw_name, "reason": "source exceeds upload size limit"})
+            continue
         normalized_name = raw_name.replace("\\", "/")
         if "/" in normalized_name:
             rejected.append({"name": raw_name, "reason": "project folders must be uploaded as a .zip file"})

@@ -24,6 +24,7 @@ from app.services.java_analysis import junit4_scaffold
 from app.services.job_service import JobSubmission, mark_queue_failure, submit_job
 from app.services.prompt_service import render_generation_prompt, render_repair_prompt
 from app.services.react_tool_agent import ReactToolAgent
+from app.services.sandbox_client import SandboxUnavailable, run_sandbox_operation
 from app.services.skills import DEFAULT_SKILL_REGISTRY
 from app.services.source_selection import file_source_name, is_uploaded_test_source, source_role_analysis, test_source_reason
 from app.services.storage_service import put_object
@@ -3686,7 +3687,114 @@ class AgentService:
             ignored.append(str(candidate.relative_to(work_project)).replace("\\", "/"))
         return ignored
 
+    def sandbox_failure(
+        self,
+        artifact: GeneratedArtifact,
+        test_class: str,
+        project_root: Path,
+        reason: str,
+        *,
+        stage: str = "sandbox",
+    ) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "tool": "run_coverage",
+            "available": False,
+            "stage": stage,
+            "reason": reason,
+            "diagnosis": f"受限构建容器不可用：{reason}",
+            "artifact": artifact_summary(artifact),
+            "test_class": test_class,
+            "source_scope": "sandbox_maven_project",
+            "project_root": str(project_root),
+        }
+
+    def compile_maven_artifact_in_sandbox(self, artifact: GeneratedArtifact, file: UploadedFile, project_root: Path) -> dict[str, Any]:
+        code, test_rel_path, test_class = self.project_test_code_and_path(file, artifact)
+        try:
+            result = run_sandbox_operation(
+                "compile",
+                project_root,
+                {"test_relative_path": test_rel_path, "test_code": code, "test_class": test_class},
+                settings.maven_compile_timeout_seconds,
+            )
+        except SandboxUnavailable as exc:
+            failure = self.sandbox_failure(artifact, test_class, project_root, str(exc), stage="sandbox_compile")
+            failure["tool"] = "compile_artifact"
+            return failure
+
+        output = truncate(str(result.get("output") or ""), 12000)
+        ok = bool(result.get("ok"))
+        return {
+            "ok": ok,
+            "tool": "compile_artifact",
+            "available": True,
+            "stage": result.get("stage") or "maven_compile",
+            "return_code": result.get("return_code"),
+            "output": output,
+            "diagnosis": "" if ok else concise_failure_reason({"stage": result.get("stage") or "maven_compile", "output": output}),
+            "artifact": artifact_summary(artifact),
+            "test_class": test_class,
+            "source_scope": "sandbox_maven_project",
+            "project_root": str(project_root),
+            "elapsed_seconds": result.get("elapsed_seconds"),
+            "ignored_existing_test_sources": result.get("ignored_existing_test_sources") or [],
+        }
+
+    def run_maven_coverage_in_sandbox(self, artifact: GeneratedArtifact, file: UploadedFile, project_root: Path) -> dict[str, Any]:
+        code, test_rel_path, test_class = self.project_test_code_and_path(file, artifact)
+        try:
+            result = run_sandbox_operation(
+                "coverage",
+                project_root,
+                {
+                    "test_relative_path": test_rel_path,
+                    "test_code": code,
+                    "test_class": test_class,
+                    "target_class": str((file.analysis or {}).get("class_name") or ""),
+                    "test_timeout": settings.maven_test_timeout_seconds,
+                    "report_timeout": settings.maven_report_timeout_seconds,
+                },
+                settings.maven_test_timeout_seconds + settings.maven_report_timeout_seconds,
+            )
+        except SandboxUnavailable as exc:
+            return self.sandbox_failure(artifact, test_class, project_root, str(exc), stage="sandbox_coverage")
+
+        output = truncate(str(result.get("junit_output") or result.get("output") or ""), 12000)
+        stage = str(result.get("stage") or "")
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "tool": "run_coverage",
+                "available": True,
+                "stage": stage or "maven_test",
+                "return_code": result.get("return_code"),
+                "output": output,
+                "diagnosis": concise_failure_reason({"stage": stage or "maven_test", "output": output}),
+                "artifact": artifact_summary(artifact),
+                "test_class": test_class,
+                "source_scope": "sandbox_maven_project",
+                "project_root": str(project_root),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "ignored_existing_test_sources": result.get("ignored_existing_test_sources") or [],
+            }
+        return {
+            "ok": True,
+            "tool": "run_coverage",
+            "artifact": artifact_summary(artifact),
+            "test_class": test_class,
+            "source_file": {"id": file.id, "name": file.original_name, "class_name": (file.analysis or {}).get("class_name")},
+            "source_scope": "sandbox_maven_project",
+            "project_root": str(project_root),
+            "junit_output": output[-3000:],
+            "coverage": result.get("coverage") or {"ok": False, "reason": "Sandbox runner did not return a JaCoCo report."},
+            "ignored_existing_test_sources": result.get("ignored_existing_test_sources") or [],
+            "elapsed_seconds": result.get("elapsed_seconds"),
+        }
+
     def compile_maven_artifact(self, artifact: GeneratedArtifact, file: UploadedFile, project_root: Path) -> dict[str, Any]:
+        if settings.sandbox_runner_enabled:
+            return self.compile_maven_artifact_in_sandbox(artifact, file, project_root)
         mvn = shutil.which("mvn")
         if not mvn:
             return {"ok": False, "tool": "compile_artifact", "available": False, "reason": "mvn was not found in PATH."}
@@ -3743,6 +3851,14 @@ class AgentService:
             }
 
     def run_maven_coverage_events(self, artifact: GeneratedArtifact, file: UploadedFile, project_root: Path) -> Iterator[dict[str, Any]]:
+        if settings.sandbox_runner_enabled:
+            yield {
+                "event": "status",
+                "message": "正在受限构建容器中运行 Maven、JUnit 和 JaCoCo。",
+                "stage": "sandbox_dispatch",
+                "percent": 12,
+            }
+            return self.run_maven_coverage_in_sandbox(artifact, file, project_root)
         mvn = shutil.which("mvn")
         if not mvn:
             return {"ok": False, "tool": "run_coverage", "available": False, "reason": "mvn was not found in PATH."}
@@ -3895,6 +4011,8 @@ class AgentService:
             }
 
     def run_maven_coverage(self, artifact: GeneratedArtifact, file: UploadedFile, project_root: Path) -> dict[str, Any]:
+        if settings.sandbox_runner_enabled:
+            return self.run_maven_coverage_in_sandbox(artifact, file, project_root)
         mvn = shutil.which("mvn")
         if not mvn:
             return {"ok": False, "tool": "run_coverage", "available": False, "reason": "mvn was not found in PATH."}

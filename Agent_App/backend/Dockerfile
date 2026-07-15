@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    HOME=/home/app \
     PROJECT_ROOT=/app \
     STORAGE_DIR=/app/storage \
     ENABLE_JAVA_COMPILE=1 \
@@ -15,6 +16,8 @@ WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends default-jdk-headless maven \
+    && groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/app --shell /usr/sbin/nologin app \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /opt/java-libs \
@@ -27,6 +30,7 @@ COPY LLM_Test_Gen/Agent_App/backend/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY LLM_Test_Gen/Agent_App/backend/app /app/app
+COPY LLM_Test_Gen/Agent_App/backend/sandbox /opt/sandbox
 COPY LLM_Test_Gen/Java_Scripts /app/LLM_Test_Gen/Java_Scripts
 COPY LLM_Test_Gen/Python_Scripts /app/LLM_Test_Gen/Python_Scripts
 COPY LLM_Test_Gen/Data /app/LLM_Test_Gen/Data
@@ -34,7 +38,9 @@ COPY LLM_Test_Gen/Data /app/LLM_Test_Gen/Data
 RUN test -s "$METHOD_CONTEXT_EXTRACTOR_JAR" \
     || mvn -q -f /app/LLM_Test_Gen/Java_Scripts/method-context-extractor/pom.xml -DskipTests package
 
-RUN mkdir -p /app/storage
+RUN mkdir -p /app/storage /home/app/.m2 \
+    && chown -R app:app /app /home/app /opt/sandbox
 
 EXPOSE 8000
+USER app
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

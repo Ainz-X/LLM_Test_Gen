@@ -3,8 +3,10 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import hashlib
+import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -17,6 +19,7 @@ from app.core.config import settings
 from app.db import SessionLocal, init_db
 from app.models import AgentJob, CodeContext, UploadedFile
 from app.services.code_context_service import build_code_context, class_fqn_from_analysis, class_fqn_from_method_fqn
+from app.services.sandbox_client import SandboxUnavailable, run_sandbox_operation
 
 
 EXTRACTOR_VERSION = "method-context-extractor-0.2.0"
@@ -51,7 +54,13 @@ def cancelled(db: Session, job: AgentJob) -> bool:
 def run_process(db: Session, job: AgentJob, command: list[str], cwd: Path, timeout: int, stage: str, message: str, progress: int) -> dict[str, Any]:
     update_job(db, job, status="running", progress=progress, stage=stage, message=f"{progress}%：{message}")
     started = time.monotonic()
-    process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+
+    def stop_process_group() -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     while True:
         try:
             stdout, stderr = process.communicate(timeout=5)
@@ -64,7 +73,7 @@ def run_process(db: Session, job: AgentJob, command: list[str], cwd: Path, timeo
         except subprocess.TimeoutExpired:
             elapsed = int(time.monotonic() - started)
             if cancelled(db, job):
-                process.kill()
+                stop_process_group()
                 stdout, stderr = process.communicate()
                 return {
                     "return_code": None,
@@ -73,7 +82,7 @@ def run_process(db: Session, job: AgentJob, command: list[str], cwd: Path, timeo
                     "cancelled": True,
                 }
             if elapsed >= timeout:
-                process.kill()
+                stop_process_group()
                 stdout, stderr = process.communicate()
                 return {
                     "return_code": None,
@@ -243,6 +252,61 @@ def store_extractor_rows(db: Session, user_id: str, files: list[UploadedFile], p
     return count
 
 
+def extract_maven_project_in_sandbox(db: Session, job: AgentJob, files: list[UploadedFile], project_id: str, project_root: Path) -> tuple[int, dict[str, Any]]:
+    include_classes = sorted({class_fqn_from_analysis(file.analysis or {}) for file in files if (file.analysis or {}).get("class_name")})
+    update_job(
+        db,
+        job,
+        status="running",
+        progress=20,
+        stage="sandbox_dispatch",
+        message="20%：正在将项目快照提交到受限构建容器提取 Jimple。",
+    )
+    try:
+        result = run_sandbox_operation(
+            "context",
+            project_root,
+            {
+                "include_classes": include_classes,
+                "compile_timeout": max(settings.context_extract_timeout_seconds, 180),
+                "extract_timeout": max(settings.context_extract_timeout_seconds, 300),
+            },
+            max(settings.context_extract_timeout_seconds, 300),
+        )
+    except SandboxUnavailable as exc:
+        rows = sum(store_lightweight_context(db, job.user_id, file, project_id) for file in files)
+        return rows, {"mode": "lightweight", "reason": f"Sandbox runner unavailable: {exc}"}
+
+    if not result.get("ok"):
+        rows = sum(store_lightweight_context(db, job.user_id, file, project_id) for file in files)
+        stage = result.get("stage") or "sandbox"
+        return rows, {
+            "mode": "lightweight",
+            "reason": f"Sandbox {stage} failed; stored lightweight context without Jimple.",
+            "sandbox_output": str(result.get("output") or result.get("reason") or "")[-4000:],
+        }
+
+    csv_text = str(result.get("csv") or "")
+    if not csv_text:
+        rows = sum(store_lightweight_context(db, job.user_id, file, project_id) for file in files)
+        return rows, {"mode": "lightweight", "reason": "Sandbox extractor returned no context CSV."}
+    job_root = settings.storage_dir / "context_jobs" / job.id / project_id
+    job_root.mkdir(parents=True, exist_ok=True)
+    output_csv = job_root / "Method_Context.csv"
+    output_csv.write_text(csv_text, encoding="utf-8")
+    update_job(db, job, progress=88, stage="store_context", message="88%：正在保存受限构建容器提取的代码上下文。")
+    rows = store_extractor_rows(db, job.user_id, files, project_id, output_csv)
+    if rows == 0:
+        rows = sum(store_lightweight_context(db, job.user_id, file, project_id) for file in files)
+        return rows, {"mode": "lightweight", "reason": "Sandbox extractor produced no matching rows."}
+    return rows, {
+        "mode": "sandbox_sootup_javaparser",
+        "output_csv": str(output_csv),
+        "compile_elapsed_seconds": result.get("compile_elapsed_seconds"),
+        "extract_elapsed_seconds": result.get("extract_elapsed_seconds"),
+    }
+
+
 def mark_files_context(db: Session, files: list[UploadedFile], job: AgentJob, rows_by_file: dict[str, int]) -> None:
     now = dt.datetime.utcnow().isoformat()
     for file in files:
@@ -262,6 +326,8 @@ def extract_maven_project(db: Session, job: AgentJob, files: list[UploadedFile],
     if not (project_root / "pom.xml").exists():
         rows = sum(store_lightweight_context(db, job.user_id, file, project_id) for file in files)
         return rows, {"mode": "lightweight", "reason": "Only Maven projects are supported for SootUp extraction in this worker."}
+    if settings.sandbox_runner_enabled:
+        return extract_maven_project_in_sandbox(db, job, files, project_id, project_root)
     extractor_jar = settings.method_context_extractor_jar
     if not extractor_jar.exists():
         rows = sum(store_lightweight_context(db, job.user_id, file, project_id) for file in files)

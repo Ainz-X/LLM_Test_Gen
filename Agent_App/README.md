@@ -114,4 +114,28 @@ JACOCO_CLI_PATH=/opt/java-libs/org.jacoco.cli-0.8.12-nodeps.jar
 
 Coverage can still fail for legitimate project reasons: missing third-party dependencies, incomplete folder uploads, tests that do not compile, or source packages that require a full Maven/Gradle project. The agent reports the real compile/test/report stage instead of inventing a percentage.
 
+### Maven cache maintenance
+
+Maven dependencies are kept in named Docker volumes so a normal container restart does not redownload the same artifacts. The sandbox cache is separate from the worker cache by design. Use the opt-in maintenance profile only when no Maven build is running:
+
+```bash
+# Show the size and file count of both persistent Maven caches.
+docker compose --profile maintenance run --rm maven-cache-maintenance
+
+# Preview a cleanup. No files are removed in dry-run mode.
+docker compose --profile maintenance run --rm maven-cache-maintenance prune --dry-run
+
+# Remove failed-download markers, files older than 30 days, then trim each cache to 1 GB.
+docker compose --profile maintenance run --rm maven-cache-maintenance prune
+```
+
+Override the defaults without changing the compose file:
+
+```bash
+$env:MAVEN_CACHE_MAX_SIZE_MB=512; $env:MAVEN_CACHE_MAX_AGE_DAYS=14
+docker compose --profile maintenance run --rm maven-cache-maintenance prune
+```
+
+This command manages Maven dependency volumes only. It does not remove Docker images, build cache, database data, uploaded projects, or generated test artifacts.
+
 The deployable app keeps the current A3 pipeline as a tool backend instead of replacing it.

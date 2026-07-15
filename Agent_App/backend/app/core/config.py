@@ -48,6 +48,14 @@ class Settings:
     maven_test_timeout_seconds = int(os.getenv("MAVEN_TEST_TIMEOUT_SECONDS", "300"))
     maven_report_timeout_seconds = int(os.getenv("MAVEN_REPORT_TIMEOUT_SECONDS", "180"))
     context_extract_timeout_seconds = int(os.getenv("CONTEXT_EXTRACT_TIMEOUT_SECONDS", "300"))
+    sandbox_runner_enabled = os.getenv("SANDBOX_RUNNER_ENABLED", "1") == "1"
+    sandbox_runner_url = os.getenv("SANDBOX_RUNNER_URL", "http://sandbox-runner:8090")
+    sandbox_runner_token = os.getenv("SANDBOX_RUNNER_TOKEN", "")
+    sandbox_runner_timeout_seconds = int(os.getenv("SANDBOX_RUNNER_TIMEOUT_SECONDS", "360"))
+    max_project_archive_bytes = int(os.getenv("MAX_PROJECT_ARCHIVE_BYTES", str(150 * 1024 * 1024)))
+    max_project_archive_entries = int(os.getenv("MAX_PROJECT_ARCHIVE_ENTRIES", "10000"))
+    max_project_unpacked_bytes = int(os.getenv("MAX_PROJECT_UNPACKED_BYTES", str(750 * 1024 * 1024)))
+    max_project_compression_ratio = int(os.getenv("MAX_PROJECT_COMPRESSION_RATIO", "100"))
     minio_enabled = os.getenv("MINIO_ENABLED", "0") == "1"
     minio_endpoint = os.getenv("MINIO_ENDPOINT", "localhost:9000")
     minio_access_key = os.getenv("MINIO_ACCESS_KEY", "minioadmin")

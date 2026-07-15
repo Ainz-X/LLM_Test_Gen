@@ -16,3 +16,4 @@ langchain-openai>=1.0,<2
 PyYAML>=6.0.1
 celery[redis]==5.4.0
 redis==5.2.1
+httpx==0.28.1
