@@ -9,6 +9,7 @@ import {
   FileCode2,
   HelpCircle,
   History,
+  ListChecks,
   LogOut,
   MoreVertical,
   PackageOpen,
@@ -180,6 +181,15 @@ function stableMessageOrder(messageList: Message[]) {
       return rankDelta || left.index - right.index;
     })
     .map((item) => item.message);
+}
+
+function visibleMessageContent(message: Message, fallback = "") {
+  const content = message.content || fallback;
+  if (message.role !== "assistant") return content;
+  if (/###\s*.*\u4efb\u52a1\u6982\u8981|\u4efb\u52a1\s*ID|\u5728\u54ea\u67e5\u770b\u8fdb\u5ea6\u548c\u7ed3\u679c|\u5de5\u4f5c\u6d41.*JaCoCo/.test(content)) {
+    return "\u540e\u53f0\u4efb\u52a1\u5df2\u63d0\u4ea4\u3002\u8bf7\u4f7f\u7528\u53f3\u4e0a\u89d2\u201c\u4efb\u52a1\u201d\u67e5\u770b\u8fdb\u5ea6\u3002";
+  }
+  return content.replace(/\s*\{\s*"ok"\s*:\s*(?:true|false)[\s\S]*$/, "").trim();
 }
 
 const emptyTask: TaskModalState = {
@@ -1232,13 +1242,6 @@ function App() {
           }));
         },
         onTool: (payload) => {
-          setConversationMessages(targetConversationId, (current) =>
-            current.map((item) =>
-              item.id === assistantId
-                ? { ...item, tool_results: { items: [...(item.tool_results?.items || []), payload] } }
-                : item
-            )
-          );
           trackAgentJobFromTool(payload).catch(console.error);
         },
         onDelta: (chunk) => {
@@ -1513,6 +1516,16 @@ function App() {
             <p>{activeFile ? `${text.activeFile}${activeFile.original_name}` : text.noFile}</p>
           </div>
           <div className="header-actions">
+            <button
+              className="task-center-trigger"
+              type="button"
+              title="\u67e5\u770b\u540e\u53f0\u4efb\u52a1\u8fdb\u5ea6"
+              onClick={() => setTaskModal((current) => (current.jobId ? { ...current, open: true } : current))}
+              disabled={!taskModal.jobId}
+            >
+              <ListChecks size={17} />
+              {taskModal.running ? `\u4efb\u52a1 ${Math.round(taskModal.progress)}%` : "\u4efb\u52a1"}
+            </button>
             <button type="button" onClick={() => submitChat(undefined, suggestions[0])} disabled={!activeFileId || chatBusy}>
               <Bot size={17} />
               {text.generate}
@@ -1531,16 +1544,7 @@ function App() {
                 <article className={`message ${message.role}`} key={message.id}>
                   <div className="avatar">{message.role === "user" ? "U" : "A"}</div>
                   <div className="message-body">
-                    <pre>{message.content || (message.role === "assistant" && chatBusy ? activeChatRun?.status || "Thinking" : "")}</pre>
-                    {coverageReports(message.tool_results?.items).map((report, index) => (
-                      <CoverageReportCard key={`${message.id}-coverage-${index}`} report={report} />
-                    ))}
-                    {message.tool_results?.items?.length ? (
-                      <details>
-                        <summary>{message.tool_results.items.length} {text.toolResults}</summary>
-                        <code>{JSON.stringify(message.tool_results.items, null, 2)}</code>
-                      </details>
-                    ) : null}
+                    <pre>{visibleMessageContent(message, message.role === "assistant" && chatBusy ? activeChatRun?.status || "Thinking" : "")}</pre>
                     {message.role === "assistant" && !message.id.startsWith("local-") && (
                       <div className="feedback-row">
                         <button type="button" title={text.helpful} onClick={() => rateMessage(message.id, "up").catch(console.error)}>
@@ -1738,7 +1742,7 @@ function App() {
         <div
           className="modal-backdrop"
           role="presentation"
-          onMouseDown={() => setTaskModal(emptyTask)}
+          onMouseDown={() => setTaskModal((current) => ({ ...current, open: false }))}
         >
           <section className="task-modal" role="dialog" aria-modal="true" aria-label={taskModal.title} onMouseDown={(event) => event.stopPropagation()}>
             <header className="modal-header">
@@ -1766,7 +1770,7 @@ function App() {
                     强制中断
                   </button>
                 )}
-                <button type="button" onClick={() => setTaskModal(emptyTask)}>
+                <button type="button" onClick={() => setTaskModal((current) => ({ ...current, open: false }))}>
                   {text.close}
                 </button>
               </div>
@@ -1799,7 +1803,7 @@ function App() {
                         type="button"
                         onClick={() => {
                           setActiveFileId(file.id);
-                          setTaskModal(emptyTask);
+                          setTaskModal((current) => ({ ...current, open: false }));
                         }}
                       >
                         <strong>{javaDisplayName(file)}</strong>

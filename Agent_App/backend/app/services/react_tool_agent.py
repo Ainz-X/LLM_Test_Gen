@@ -46,10 +46,12 @@ Rules:
 5. For coverage, JaCoCo, batch test generation, or low-coverage repair, start
    the corresponding background job tool. It returns job_id immediately. Do
    not run Maven or a multi-file repair synchronously in the chat request.
-6. Once a background job is submitted, tell the user it is running and rely on
-   the UI task progress stream. Do not poll or submit the same workload again.
-7. Never print a fake tool call, JSON action block, or an internal routing
-   explanation to the user. Give a concise result after the tool work ends.
+6. Once a background job is submitted, tell the user only that it has been
+   submitted and can be viewed through the upper-right task entry. Do not poll
+   or submit the same workload again. Do not provide a task table, task ID,
+   timing estimate, workflow narration, or UI tutorial.
+7. Never print a fake tool call, JSON action block, tool result, log, or an
+   internal routing explanation to the user. Give a concise, user-facing result.
 """.strip()
 
 
@@ -239,10 +241,13 @@ class ReactToolAgent:
         ):
             if part["type"] == "messages":
                 message, _metadata = part["data"]
-                text = _content_text(getattr(message, "content", ""))
-                if text:
-                    emitted_text = True
-                    yield {"event": "delta", "text": text}
+                # ToolMessage content is serialized tool JSON. Only stream LLM
+                # chunks so implementation payloads never become chat content.
+                if isinstance(message, AIMessage):
+                    text = _content_text(getattr(message, "content", ""))
+                    if text:
+                        emitted_text = True
+                        yield {"event": "delta", "text": text}
                 continue
             if part["type"] == "custom":
                 event = part["data"]
@@ -263,7 +268,7 @@ class ReactToolAgent:
                         name = call.get("name") or "tool"
                         yield {"event": "status", "message": f"正在调用工具：{name}"}
                     text = _content_text(getattr(message, "content", ""))
-                    if text and not emitted_text:
+                    if text and not calls and not emitted_text:
                         emitted_text = True
                         yield {"event": "delta", "text": text}
 
