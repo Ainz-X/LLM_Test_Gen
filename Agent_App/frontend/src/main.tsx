@@ -1738,9 +1738,7 @@ function App() {
         <div
           className="modal-backdrop"
           role="presentation"
-          onMouseDown={() => {
-            if (!taskModal.running) setTaskModal(emptyTask);
-          }}
+          onMouseDown={() => setTaskModal(emptyTask)}
         >
           <section className="task-modal" role="dialog" aria-modal="true" aria-label={taskModal.title} onMouseDown={(event) => event.stopPropagation()}>
             <header className="modal-header">
@@ -1768,7 +1766,7 @@ function App() {
                     强制中断
                   </button>
                 )}
-                <button type="button" onClick={() => setTaskModal(emptyTask)} disabled={taskModal.running}>
+                <button type="button" onClick={() => setTaskModal(emptyTask)}>
                   {text.close}
                 </button>
               </div>
@@ -1801,7 +1799,7 @@ function App() {
                         type="button"
                         onClick={() => {
                           setActiveFileId(file.id);
-                          if (!taskModal.running) setTaskModal(emptyTask);
+                          setTaskModal(emptyTask);
                         }}
                       >
                         <strong>{javaDisplayName(file)}</strong>
