@@ -42,6 +42,7 @@ import {
   extractCodeContext,
   generateTestsBatch,
   getArtifacts,
+  getAgentJobs,
   getConversations,
   getFiles,
   getMessages,
@@ -425,6 +426,9 @@ function App() {
   const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [taskModal, setTaskModal] = useState<TaskModalState>(emptyTask);
+  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
+  const [taskCenterLoading, setTaskCenterLoading] = useState(false);
+  const [recentJobs, setRecentJobs] = useState<AgentJob[]>([]);
   const [openConversationMenuId, setOpenConversationMenuId] = useState<string | undefined>();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const chatAbortRefs = useRef<Record<string, AbortController>>({});
@@ -480,9 +484,60 @@ function App() {
     if (!activeFileId && fileRows[0]) setActiveFileId(fileRows[0].id);
   }
 
+  async function loadRecentJobs() {
+    setTaskCenterLoading(true);
+    try {
+      const jobs = await getAgentJobs();
+      setRecentJobs(jobs);
+      return jobs;
+    } finally {
+      setTaskCenterLoading(false);
+    }
+  }
+
+  function jobFileIds(job: AgentJob) {
+    const request = job.request_json || {};
+    const ids = Array.isArray(request.file_ids) ? request.file_ids.map(String) : [];
+    if (request.file_id) ids.push(String(request.file_id));
+    return Array.from(new Set(ids));
+  }
+
+  function jobTitle(job: AgentJob) {
+    if (job.kind === "batch_coverage") return "JaCoCo coverage job";
+    if (job.kind === "batch_low_coverage_repair") return "Low coverage repair job";
+    if (job.kind === "code_context_extraction") return "Code context extraction";
+    return "Batch test generation";
+  }
+
+  function jobStatus(job: AgentJob) {
+    if (job.status === "queued") return "\u961f\u5217\u4e2d";
+    if (job.status === "running") return "\u8fd0\u884c\u4e2d";
+    if (job.status === "succeeded") return "\u5df2\u5b8c\u6210";
+    if (job.status === "cancelled") return "\u5df2\u4e2d\u65ad";
+    return "\u5931\u8d25";
+  }
+
+  function openTaskCenter() {
+    setTaskCenterOpen(true);
+    loadRecentJobs().catch(console.error);
+  }
+
+  function openPersistedJob(job: AgentJob) {
+    setTaskCenterOpen(false);
+    const payload: Record<string, unknown> = { job, file_ids: jobFileIds(job) };
+    if (job.kind === "code_context_extraction") payload.tool = "extract_code_context";
+    trackAgentJobFromTool(payload).catch(console.error);
+  }
+
   useEffect(() => {
     if (authed) refresh().catch(console.error);
   }, [authed]);
+
+  useEffect(() => {
+    if (!taskCenterOpen || !authed) return;
+    const timer = window.setInterval(() => loadRecentJobs().catch(console.error), 2500);
+    return () => window.clearInterval(timer);
+  }, [taskCenterOpen, authed]);
 
   useEffect(() => {
     if (!conversationId) {
@@ -1055,7 +1110,10 @@ function App() {
       return trackContextJobFromTool(payload);
     }
     if (!new Set(["batch_test_generation", "batch_coverage", "batch_low_coverage_repair"]).has(job.kind)) return;
-    if (trackedJobIds.current.has(job.id)) return;
+    if (trackedJobIds.current.has(job.id)) {
+      setTaskModal((current) => (current.jobId === job.id ? { ...current, open: true } : current));
+      return;
+    }
     trackedJobIds.current.add(job.id);
     const fileIds = Array.isArray(payload.file_ids) ? payload.file_ids.map(String) : [];
     const controller = new AbortController();
@@ -1115,6 +1173,11 @@ function App() {
     if (payload.tool !== "extract_code_context") return;
     const job = payload.job as AgentJob | undefined;
     if (!job?.id) return;
+    if (trackedJobIds.current.has(job.id)) {
+      setTaskModal((current) => (current.jobId === job.id ? { ...current, open: true } : current));
+      return;
+    }
+    trackedJobIds.current.add(job.id);
     const fileIds = Array.isArray(payload.file_ids) ? payload.file_ids.map(String) : activeFileId ? [activeFileId] : [];
     const controller = new AbortController();
     contextAbortRef.current = { controller, jobId: job.id };
@@ -1186,6 +1249,7 @@ function App() {
         }));
       }
     } finally {
+      trackedJobIds.current.delete(job.id);
       if (contextAbortRef.current?.jobId === job.id) {
         contextAbortRef.current = null;
       }
@@ -1520,8 +1584,7 @@ function App() {
               className="task-center-trigger"
               type="button"
               title="\u67e5\u770b\u540e\u53f0\u4efb\u52a1\u8fdb\u5ea6"
-              onClick={() => setTaskModal((current) => (current.jobId ? { ...current, open: true } : current))}
-              disabled={!taskModal.jobId}
+              onClick={openTaskCenter}
             >
               <ListChecks size={17} />
               {taskModal.running ? `\u4efb\u52a1 ${Math.round(taskModal.progress)}%` : "\u4efb\u52a1"}
@@ -1737,6 +1800,43 @@ function App() {
           </aside>
         </div>
       </section>
+
+      {taskCenterOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setTaskCenterOpen(false)}>
+          <section className="task-modal task-center-modal" role="dialog" aria-modal="true" aria-label="\u540e\u53f0\u4efb\u52a1" onMouseDown={(event) => event.stopPropagation()}>
+            <header className="modal-header">
+              <div>
+                <div className="section-title">
+                  <ListChecks size={16} />
+                  \u540e\u53f0\u4efb\u52a1
+                </div>
+                <p className="muted">\u663e\u793a\u5f53\u524d\u8d26\u53f7\u6700\u8fd1\u7684\u4efb\u52a1\u53ca\u5b9e\u65f6\u8fdb\u5ea6</p>
+              </div>
+              <div className="modal-actions">
+                <button type="button" onClick={() => loadRecentJobs().catch(console.error)} disabled={taskCenterLoading}>\u5237\u65b0</button>
+                <button type="button" onClick={() => setTaskCenterOpen(false)}>{text.close}</button>
+              </div>
+            </header>
+            <div className="task-body task-center-body">
+              {taskCenterLoading && !recentJobs.length ? (
+                <p className="muted">{text.loading}</p>
+              ) : recentJobs.length ? (
+                <div className="task-file-list task-job-list">
+                  {recentJobs.map((job) => (
+                    <button className="task-file-row task-job-row" type="button" key={job.id} onClick={() => openPersistedJob(job)}>
+                      <span className="task-job-heading"><strong>{jobTitle(job)}</strong><em>{jobStatus(job)}</em></span>
+                      <span>{job.message || job.stage || "-"}</span>
+                      <span className="task-job-progress"><span className="progress-track"><span className="progress-fill" style={{ width: `${Math.max(0, Math.min(100, Number(job.progress || 0)))}%` }} /></span><b>{Math.round(Number(job.progress || 0))}%</b></span>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">\u6682\u65e0\u540e\u53f0\u4efb\u52a1</p>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
 
       {taskModal.open && (
         <div

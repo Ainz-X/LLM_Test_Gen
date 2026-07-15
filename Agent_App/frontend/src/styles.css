@@ -1121,6 +1121,52 @@ details code,
   font-size: 12px;
 }
 
+.task-center-modal {
+  width: min(640px, calc(100vw - 48px));
+}
+
+.task-center-body {
+  padding: 16px;
+  overflow: auto;
+}
+
+.task-job-list {
+  max-height: min(520px, calc(100vh - 210px));
+}
+
+.task-job-row {
+  gap: 8px;
+}
+
+.task-job-heading,
+.task-job-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.task-job-heading {
+  justify-content: space-between;
+}
+
+.task-job-heading em {
+  color: var(--accent);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.task-job-progress .progress-track {
+  flex: 1;
+  height: 7px;
+}
+
+.task-job-progress b {
+  min-width: 38px;
+  color: var(--text);
+  font-size: 12px;
+  text-align: right;
+}
+
 .result-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

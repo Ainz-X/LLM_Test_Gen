@@ -384,6 +384,10 @@ export async function streamJob(jobId: string, handlers: JobStreamHandlers, sign
   }
 }
 
+export function getAgentJobs(limit = 12) {
+  return request<AgentJob[]>(`/files/jobs?limit=${encodeURIComponent(String(limit))}`);
+}
+
 export function cancelJob(jobId: string) {
   return request<{ ok: boolean; job_id: string; cancel_requested: boolean; status: string }>(
     `/files/jobs/${encodeURIComponent(jobId)}/cancel`,

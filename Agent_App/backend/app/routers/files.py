@@ -832,6 +832,21 @@ def extract_context(
     return job
 
 
+@router.get("/jobs", response_model=list[AgentJobOut])
+def list_jobs(
+    limit: int = Query(default=12, ge=1, le=50),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return (
+        db.query(AgentJob)
+        .filter(AgentJob.user_id == user.id)
+        .order_by(AgentJob.updated_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+
 @router.get("/jobs/{job_id}", response_model=AgentJobOut)
 def get_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     job = db.get(AgentJob, job_id)
