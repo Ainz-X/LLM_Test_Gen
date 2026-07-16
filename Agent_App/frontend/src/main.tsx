@@ -33,6 +33,7 @@ import {
   UploadedFile,
   cancelBatchGenerate,
   cancelJob,
+  clearCompletedJobs,
   createConversation,
   deleteConversation,
   deleteUploadedFiles,
@@ -429,6 +430,7 @@ function App() {
   const [taskCenterOpen, setTaskCenterOpen] = useState(false);
   const [taskCenterLoading, setTaskCenterLoading] = useState(false);
   const [recentJobs, setRecentJobs] = useState<AgentJob[]>([]);
+  const [exportNotice, setExportNotice] = useState("");
   const [openConversationMenuId, setOpenConversationMenuId] = useState<string | undefined>();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const chatAbortRefs = useRef<Record<string, AbortController>>({});
@@ -503,18 +505,18 @@ function App() {
   }
 
   function jobTitle(job: AgentJob) {
-    if (job.kind === "batch_coverage") return "JaCoCo coverage job";
-    if (job.kind === "batch_low_coverage_repair") return "Low coverage repair job";
-    if (job.kind === "code_context_extraction") return "Code context extraction";
-    return "Batch test generation";
+    if (job.kind === "batch_coverage") return "JaCoCo 覆盖率分析";
+    if (job.kind === "batch_low_coverage_repair") return "低覆盖率修复";
+    if (job.kind === "code_context_extraction") return "代码上下文提取";
+    return "批量生成测试";
   }
 
   function jobStatus(job: AgentJob) {
-    if (job.status === "queued") return "\u961f\u5217\u4e2d";
-    if (job.status === "running") return "\u8fd0\u884c\u4e2d";
-    if (job.status === "succeeded") return "\u5df2\u5b8c\u6210";
-    if (job.status === "cancelled") return "\u5df2\u4e2d\u65ad";
-    return "\u5931\u8d25";
+    if (job.status === "queued") return "队列中";
+    if (job.status === "running") return "运行中";
+    if (job.status === "succeeded") return "已完成";
+    if (job.status === "cancelled") return "已中断";
+    return "失败";
   }
 
   function openTaskCenter() {
@@ -527,6 +529,19 @@ function App() {
     const payload: Record<string, unknown> = { job, file_ids: jobFileIds(job) };
     if (job.kind === "code_context_extraction") payload.tool = "extract_code_context";
     trackAgentJobFromTool(payload).catch(console.error);
+  }
+
+  async function clearFinishedJobs() {
+    const finished = recentJobs.filter((job) => ["succeeded", "failed", "cancelled"].includes(job.status));
+    if (!finished.length || !window.confirm(`清空 ${finished.length} 条已完成任务记录？运行中的任务会保留。`)) return;
+    setTaskCenterLoading(true);
+    try {
+      await clearCompletedJobs();
+      setRecentJobs((current) => current.filter((job) => !["succeeded", "failed", "cancelled"].includes(job.status)));
+      setTaskModal((current) => (current.jobId && !current.running ? emptyTask : current));
+    } finally {
+      setTaskCenterLoading(false);
+    }
   }
 
   useEffect(() => {
@@ -646,7 +661,9 @@ function App() {
   }
 
   async function exportConversationInline(conversation: Conversation, format: "markdown" | "json") {
-    await exportConversation(conversation, format);
+    const fileName = await exportConversation(conversation, format);
+    setExportNotice(`已开始导出 ${fileName}`);
+    window.setTimeout(() => setExportNotice(""), 2400);
     setOpenConversationMenuId(undefined);
   }
 
@@ -1583,7 +1600,7 @@ function App() {
             <button
               className="task-center-trigger"
               type="button"
-              title="\u67e5\u770b\u540e\u53f0\u4efb\u52a1\u8fdb\u5ea6"
+              title="查看后台任务进度"
               onClick={openTaskCenter}
             >
               <ListChecks size={17} />
@@ -1808,12 +1825,13 @@ function App() {
               <div>
                 <div className="section-title">
                   <ListChecks size={16} />
-                  \u540e\u53f0\u4efb\u52a1
+                  后台任务
                 </div>
-                <p className="muted">\u663e\u793a\u5f53\u524d\u8d26\u53f7\u6700\u8fd1\u7684\u4efb\u52a1\u53ca\u5b9e\u65f6\u8fdb\u5ea6</p>
+                <p className="muted">显示当前账号最近的任务及实时进度</p>
               </div>
               <div className="modal-actions">
-                <button type="button" onClick={() => loadRecentJobs().catch(console.error)} disabled={taskCenterLoading}>\u5237\u65b0</button>
+                <button type="button" className="danger-action" onClick={() => clearFinishedJobs().catch(console.error)} disabled={taskCenterLoading || !recentJobs.some((job) => ["succeeded", "failed", "cancelled"].includes(job.status))}>清空已完成</button>
+                <button type="button" onClick={() => loadRecentJobs().catch(console.error)} disabled={taskCenterLoading}>刷新</button>
                 <button type="button" onClick={() => setTaskCenterOpen(false)}>{text.close}</button>
               </div>
             </header>
@@ -1831,7 +1849,7 @@ function App() {
                   ))}
                 </div>
               ) : (
-                <p className="muted">\u6682\u65e0\u540e\u53f0\u4efb\u52a1</p>
+                <p className="muted">暂无后台任务</p>
               )}
             </div>
           </section>
@@ -1999,6 +2017,7 @@ function App() {
           </section>
         </div>
       )}
+      {exportNotice && <div className="export-notice" role="status">{exportNotice}</div>}
     </main>
   );
 }

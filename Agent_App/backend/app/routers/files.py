@@ -855,6 +855,20 @@ def get_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(get
     return job
 
 
+@router.delete("/jobs/completed")
+def delete_completed_jobs(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    deleted_count = (
+        db.query(AgentJob)
+        .filter(
+            AgentJob.user_id == user.id,
+            AgentJob.status.in_(["succeeded", "failed", "cancelled"]),
+        )
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return {"ok": True, "deleted_count": deleted_count}
+
+
 @router.get("/jobs/{job_id}/stream")
 def stream_job(job_id: str, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     job = db.get(AgentJob, job_id)

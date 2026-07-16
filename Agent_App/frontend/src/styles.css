@@ -1125,6 +1125,21 @@ details code,
   width: min(640px, calc(100vw - 48px));
 }
 
+.export-notice {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 40;
+  max-width: min(420px, calc(100vw - 48px));
+  padding: 10px 14px;
+  border: 1px solid #b7d9c9;
+  border-radius: 8px;
+  background: #eff9f3;
+  color: #17653e;
+  box-shadow: 0 10px 28px rgba(16, 24, 40, 0.16);
+  overflow-wrap: anywhere;
+}
+
 .task-center-body {
   padding: 16px;
   overflow: auto;

@@ -159,11 +159,21 @@ export async function exportConversation(conversation: Conversation, format: "ma
   const blob = await response.blob();
   const url = URL.createObjectURL(blob);
   const safeTitle = conversation.title.replace(/[\\/:*?"<>|]+/g, "-").trim() || "conversation";
+  const disposition = response.headers.get("content-disposition") || "";
+  const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const plainName = disposition.match(/filename="?([^";]+)"?/i)?.[1];
+  const fileName = encodedName ? decodeURIComponent(encodedName) : plainName || `${safeTitle}.${format === "json" ? "json" : "md"}`;
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `${safeTitle}.${format === "json" ? "json" : "md"}`;
+  anchor.download = fileName;
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
   anchor.click();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => {
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  }, 1000);
+  return fileName;
 }
 
 export function getMessages(conversationId: string) {
@@ -386,6 +396,10 @@ export async function streamJob(jobId: string, handlers: JobStreamHandlers, sign
 
 export function getAgentJobs(limit = 12) {
   return request<AgentJob[]>(`/files/jobs?limit=${encodeURIComponent(String(limit))}`);
+}
+
+export function clearCompletedJobs() {
+  return request<{ ok: boolean; deleted_count: number }>("/files/jobs/completed", { method: "DELETE" });
 }
 
 export function cancelJob(jobId: string) {

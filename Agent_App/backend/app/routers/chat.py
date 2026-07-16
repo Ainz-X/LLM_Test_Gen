@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response, StreamingResponse
@@ -26,6 +27,13 @@ def sse(event: str, data: dict) -> str:
 def safe_export_name(title: str, suffix: str) -> str:
     cleaned = re.sub(r"[^\w\u4e00-\u9fff.-]+", "-", title.strip(), flags=re.UNICODE).strip("-")
     return f"{cleaned or 'conversation'}.{suffix}"
+
+
+def export_content_disposition(title: str, suffix: str) -> str:
+    filename = safe_export_name(title, suffix)
+    fallback_stem = re.sub(r"[^A-Za-z0-9_-]+", "-", title).strip("-._")
+    fallback = f"{fallback_stem or 'conversation'}.{suffix}"
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
 
 
 def owned_conversation(db: Session, user: User, conversation_id: str) -> Conversation:
@@ -131,7 +139,7 @@ def export_conversation(
         return Response(
             json.dumps(payload, ensure_ascii=False, indent=2),
             media_type="application/json; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{safe_export_name(conversation.title, "json")}"'},
+            headers={"Content-Disposition": export_content_disposition(conversation.title, "json")},
         )
 
     lines = [
@@ -151,7 +159,7 @@ def export_conversation(
     return Response(
         "\n".join(lines),
         media_type="text/markdown; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{safe_export_name(conversation.title, "md")}"'},
+        headers={"Content-Disposition": export_content_disposition(conversation.title, "md")},
     )
 
 
