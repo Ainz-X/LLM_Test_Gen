@@ -540,6 +540,8 @@ def generate_tests_batch(
             "only_missing": payload.only_missing,
             "max_files": payload.max_files,
             "goal": payload.goal,
+            "test_name": payload.test_name,
+            "test_name_mode": payload.test_name_mode,
             "force": payload.force,
             "idempotency_key": payload.idempotency_key or request_key,
         }
@@ -687,7 +689,15 @@ def generate_tests_batch_stream(
                     },
                 )
                 try:
-                    result = service.tool_generate_tests({"file_id": row.id, "goal": payload.goal}, cancel_check=cancelled)
+                    result = service.tool_generate_tests(
+                        {
+                            "file_id": row.id,
+                            "goal": payload.goal,
+                            "test_name": payload.test_name,
+                            "test_name_mode": payload.test_name_mode,
+                        },
+                        cancel_check=cancelled,
+                    )
                     item = {
                         "file_id": row.id,
                         "file_name": row.original_name,

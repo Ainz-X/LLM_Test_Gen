@@ -117,6 +117,8 @@ class BatchGenerateIn(BaseModel):
     only_missing: bool = True
     max_files: int = Field(default=50, ge=1, le=200)
     goal: str = "Generate JUnit 4 tests for all selected Java files."
+    test_name: str | None = Field(default=None, max_length=120)
+    test_name_mode: str | None = Field(default=None, max_length=16)
     # The client key protects retried HTTP submissions. The server additionally
     # derives a workload key from the project snapshot and operation parameters.
     idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)

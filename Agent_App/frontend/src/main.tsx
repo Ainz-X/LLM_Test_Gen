@@ -136,6 +136,13 @@ type TaskModalState = {
   result?: BatchGenerateResult & { context_rows?: number; file_count?: number; groups?: unknown[] };
 };
 
+type TestNamingState = {
+  fileIds: string[];
+  title: string;
+  onlyMissing: boolean;
+  files: UploadedFile[];
+};
+
 type ChatRunState = {
   status: string;
   assistantId: string;
@@ -427,6 +434,8 @@ function App() {
   const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [taskModal, setTaskModal] = useState<TaskModalState>(emptyTask);
+  const [testNaming, setTestNaming] = useState<TestNamingState | undefined>();
+  const [testName, setTestName] = useState("");
   const [taskCenterOpen, setTaskCenterOpen] = useState(false);
   const [taskCenterLoading, setTaskCenterLoading] = useState(false);
   const [recentJobs, setRecentJobs] = useState<AgentJob[]>([]);
@@ -696,7 +705,38 @@ function App() {
     }
   }
 
-  async function generateForFiles(fileIds: string[], title: string, onlyMissing = true) {
+  function requestTestGeneration(fileIds: string[], title: string, onlyMissing = true) {
+    if (busy || !fileIds.length) return;
+    const requestedFiles = files.filter((file) => fileIds.includes(file.id));
+    const targetFiles = generationTargets(requestedFiles);
+    if (!targetFiles.length) {
+      void generateForFiles(fileIds, title, onlyMissing);
+      return;
+    }
+    setTestName("");
+    setTestNaming({ fileIds, title, onlyMissing, files: targetFiles });
+  }
+
+  function confirmTestNaming() {
+    if (!testNaming) return;
+    const request = testNaming;
+    setTestNaming(undefined);
+    void generateForFiles(
+      request.fileIds,
+      request.title,
+      request.onlyMissing,
+      testName.trim() || undefined,
+      request.files.length > 1 ? "label" : "class"
+    );
+  }
+
+  async function generateForFiles(
+    fileIds: string[],
+    title: string,
+    onlyMissing = true,
+    requestedTestName?: string,
+    testNameMode?: "class" | "label"
+  ) {
     if (busy || !fileIds.length) return;
     const requestedFiles = files.filter((file) => fileIds.includes(file.id));
     const targetFiles = generationTargets(requestedFiles);
@@ -738,7 +778,7 @@ function App() {
       setBusy(true);
       setStatus(title);
       try {
-        const job = await generateTestsBatch(targetIds, onlyMissing, requestKey);
+        const job = await generateTestsBatch(targetIds, onlyMissing, requestKey, requestedTestName, testNameMode);
         batchAbortRef.current = { controller, jobId: job.id };
         setTaskModal({
           open: true,
@@ -1000,7 +1040,7 @@ function App() {
   async function batchGenerateMissingTests() {
     const targetIds = selectedFileIds.length ? selectedFileIds : availableGenerationFiles.map((file) => file.id);
     const label = selectedFileIds.length ? "为已选生产源码生成未测测试" : "为全部生产源码生成未测测试";
-    await generateForFiles(targetIds, label, true);
+    requestTestGeneration(targetIds, label, true);
   }
 
   async function extractContextForFiles(fileIds: string[], title: string) {
@@ -1493,7 +1533,7 @@ function App() {
           className="mini-icon-btn"
           type="button"
           title={testSource ? "这是测试源码，不生成 TestTest" : "为这个 Java 文件生成测试"}
-          onClick={() => generateForFiles([file.id], `为 ${file.original_name} 生成测试`, false)}
+          onClick={() => requestTestGeneration([file.id], `为 ${file.original_name} 生成测试`, false)}
           disabled={busy || testSource}
         >
           <Bot size={15} />
@@ -1606,7 +1646,11 @@ function App() {
               <ListChecks size={17} />
               {taskModal.running ? `\u4efb\u52a1 ${Math.round(taskModal.progress)}%` : "\u4efb\u52a1"}
             </button>
-            <button type="button" onClick={() => submitChat(undefined, suggestions[0])} disabled={!activeFileId || chatBusy}>
+            <button
+              type="button"
+              onClick={() => activeFileId && requestTestGeneration([activeFileId], `为 ${activeFile?.original_name || "当前文件"} 生成测试`, false)}
+              disabled={!activeFileId || busy}
+            >
               <Bot size={17} />
               {text.generate}
             </button>
@@ -1759,7 +1803,7 @@ function App() {
                               className="project-action-btn"
                               type="button"
                               title="生成当前项目未测测试"
-                              onClick={() => generateForFiles(prodFiles.map((file) => file.id), `为项目 ${group.name} 生成未测测试`, true)}
+                              onClick={() => requestTestGeneration(prodFiles.map((file) => file.id), `为项目 ${group.name} 生成未测测试`, true)}
                               disabled={busy || !prodFiles.length}
                             >
                               生成
@@ -1818,6 +1862,59 @@ function App() {
         </div>
       </section>
 
+      {testNaming && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setTestNaming(undefined)}>
+          <section className="task-modal naming-modal" role="dialog" aria-modal="true" aria-label="命名测试文件" onMouseDown={(event) => event.stopPropagation()}>
+            <header className="modal-header">
+              <div>
+                <div className="section-title">
+                  <FileCode2 size={16} />
+                  命名测试文件
+                </div>
+                <p className="muted">{testNaming.files.length === 1 ? javaDisplayName(testNaming.files[0]) : `将为 ${testNaming.files.length} 个生产源码生成测试`}</p>
+              </div>
+              <div className="modal-actions">
+                <button type="button" onClick={() => setTestNaming(undefined)}>{text.close}</button>
+              </div>
+            </header>
+            <div className="task-body naming-body">
+              <label className="naming-field">
+                <span>{testNaming.files.length === 1 ? "测试类名称" : "测试命名标签"}</span>
+                <input
+                  autoFocus
+                  value={testName}
+                  maxLength={120}
+                  placeholder={testNaming.files.length === 1 ? "例如 SoundexContractTest" : "例如 Edge"}
+                  onChange={(event) => setTestName(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      confirmTestNaming();
+                    }
+                  }}
+                />
+              </label>
+              <p className="muted naming-hint">
+                {testNaming.files.length === 1
+                  ? "留空时会自动生成短且唯一的名称，例如 SoundexTestA3K7P2。"
+                  : "批量时会将标签拼入对应源类名，例如 SoundexEdgeTest；留空时每个文件自动使用唯一名称。"}
+              </p>
+              <div className="modal-actions naming-actions">
+                <button type="button" onClick={() => setTestNaming(undefined)}>取消</button>
+                <button
+                  className="primary-action"
+                  type="button"
+                  onClick={confirmTestNaming}
+                >
+                  <Bot size={15} />
+                  生成测试
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
+
       {taskCenterOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setTaskCenterOpen(false)}>
           <section className="task-modal task-center-modal" role="dialog" aria-modal="true" aria-label="\u540e\u53f0\u4efb\u52a1" onMouseDown={(event) => event.stopPropagation()}>
@@ -1875,7 +1972,7 @@ function App() {
                 {!!taskModal.files.length && !taskModal.running && !taskModal.result && (
                   <button
                     type="button"
-                    onClick={() => generateForFiles(generationTargets(taskModal.files).map((file) => file.id), "为上传项目生成未测测试", true)}
+                    onClick={() => requestTestGeneration(generationTargets(taskModal.files).map((file) => file.id), "为上传项目生成未测测试", true)}
                     disabled={!generationTargets(taskModal.files).length}
                   >
                     <Bot size={15} />

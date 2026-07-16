@@ -291,7 +291,13 @@ export function deleteUploadedFiles(fileIds: string[]) {
   });
 }
 
-export function generateTestsBatch(fileIds?: string[], onlyMissing = true, idempotencyKey?: string) {
+export function generateTestsBatch(
+  fileIds?: string[],
+  onlyMissing = true,
+  idempotencyKey?: string,
+  testName?: string,
+  testNameMode?: "class" | "label"
+) {
   return request<AgentJob>("/files/generate/batch", {
     method: "POST",
     headers: idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined,
@@ -300,6 +306,8 @@ export function generateTestsBatch(fileIds?: string[], onlyMissing = true, idemp
       only_missing: onlyMissing,
       max_files: 200,
       goal: "Generate JUnit 4 tests for all selected Java files.",
+      test_name: testName || undefined,
+      test_name_mode: testNameMode,
       idempotency_key: idempotencyKey
     })
   });
@@ -310,7 +318,9 @@ export async function streamGenerateTestsBatch(
   onlyMissing: boolean,
   jobId: string,
   handlers: BatchStreamHandlers,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  testName?: string,
+  testNameMode?: "class" | "label"
 ) {
   const response = await fetch(`${API_BASE}/files/generate/batch/stream`, {
     method: "POST",
@@ -324,7 +334,9 @@ export async function streamGenerateTestsBatch(
       only_missing: onlyMissing,
       max_files: 200,
       job_id: jobId,
-      goal: "Generate JUnit 4 tests for all selected Java files."
+      goal: "Generate JUnit 4 tests for all selected Java files.",
+      test_name: testName || undefined,
+      test_name_mode: testNameMode
     })
   });
   if (!response.ok || !response.body) throw new Error(await response.text());

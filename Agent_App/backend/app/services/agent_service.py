@@ -50,6 +50,47 @@ def extract_java(text: str) -> str:
     return (fenced.group(1) if fenced else text).strip() + "\n"
 
 
+def normalize_test_class_name(value: str | None) -> str | None:
+    """Turn a user-supplied filename/class name into a Java class identifier."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    candidate = re.sub(r"\.java$", "", candidate, flags=re.IGNORECASE)
+    candidate = re.split(r"[\\/]", candidate)[-1]
+    candidate = re.sub(r"[^A-Za-z0-9_$]", "", candidate)
+    if not candidate:
+        return None
+    if not re.match(r"^[A-Za-z_$]", candidate):
+        candidate = f"Test{candidate}"
+    return candidate[:120]
+
+
+def generated_test_class_name(
+    source_class_name: str,
+    file_id: str,
+    artifact_dir: Path,
+    requested_name: str | None = None,
+    name_mode: str | None = None,
+) -> str:
+    requested = normalize_test_class_name(requested_name)
+    if requested and name_mode == "label":
+        base_name = f"{source_class_name}{requested}Test"
+    elif requested:
+        base_name = requested
+    else:
+        token = hashlib.sha256(f"{file_id}:{time.time_ns()}".encode("utf-8")).hexdigest()[:4].upper()
+        base_name = f"{source_class_name}TestA3{token}"
+
+    candidate = base_name
+    sequence = 2
+    while (artifact_dir / f"{candidate}.java").exists():
+        candidate = f"{base_name}V{sequence}"
+        sequence += 1
+    return candidate
+
+
 def truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -261,10 +302,12 @@ def parse_compile_log(compile_log: str) -> list[dict[str, str]]:
     return findings
 
 
-def static_artifact_diagnosis(analysis: dict[str, Any], code: str, compile_log: str = "") -> list[dict[str, str]]:
+def static_artifact_diagnosis(
+    analysis: dict[str, Any], code: str, compile_log: str = "", expected_test_class: str | None = None
+) -> list[dict[str, str]]:
     findings: list[dict[str, str]] = []
     class_name = analysis.get("class_name") or "UploadedClass"
-    expected_test_class = f"{class_name}Test"
+    expected_test_class = expected_test_class or f"{class_name}Test"
     package_name = analysis.get("package") or ""
     package_match = re.search(r"^\s*package\s+([A-Za-z_][\w.]*)\s*;", code, re.MULTILINE)
     class_match = re.search(r"\bpublic\s+class\s+([A-Za-z_$][\w$]*)", code)
@@ -1032,9 +1075,9 @@ def describe_current_file_reply(message: str, analysis: dict[str, Any]) -> str:
     )
 
 
-def deterministic_repair(analysis: dict[str, Any], code: str) -> str:
+def deterministic_repair(analysis: dict[str, Any], code: str, expected_test_class: str | None = None) -> str:
     class_name = analysis.get("class_name") or "UploadedClass"
-    expected_test_class = f"{class_name}Test"
+    expected_test_class = expected_test_class or f"{class_name}Test"
     package_name = analysis.get("package") or ""
     repaired = extract_java(code)
 
@@ -1054,6 +1097,7 @@ def deterministic_repair(analysis: dict[str, Any], code: str) -> str:
         repaired = re.sub(r"\bpublic\s+class\s+[A-Za-z_$][\w$]*", f"public class {expected_test_class}", repaired, count=1)
     if "@Test" not in repaired:
         repaired = junit4_scaffold(analysis)
+        repaired = re.sub(r"\bpublic\s+class\s+[A-Za-z_$][\w$]*", f"public class {expected_test_class}", repaired, count=1)
     return repaired.strip() + "\n"
 
 
@@ -1615,7 +1659,15 @@ class AgentService:
         class_name = file.analysis.get("class_name") or Path(file.original_name).stem
         artifact_dir = settings.storage_dir / "generated" / self.user.id / file.id
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        artifact_path = artifact_dir / f"{class_name}Test.java"
+        test_class_name = generated_test_class_name(
+            class_name,
+            file.id,
+            artifact_dir,
+            requested_name=args.get("test_name"),
+            name_mode=args.get("test_name_mode"),
+        )
+        code = deterministic_repair(file.analysis or {}, code, test_class_name)
+        artifact_path = artifact_dir / f"{test_class_name}.java"
         artifact_path.write_text(code, encoding="utf-8")
         object_key = f"generated/{self.user.id}/{file.id}/{artifact_path.name}"
         stored_object = put_object(artifact_path, object_key)
@@ -1628,6 +1680,8 @@ class AgentService:
             prompt=prompt,
             metadata_json={
                 "goal": goal,
+                "test_class_name": test_class_name,
+                "test_name_mode": args.get("test_name_mode"),
                 "sha256": hashlib.sha256(code.encode("utf-8")).hexdigest(),
                 "object_key": stored_object,
                 "prompt_template": rendered_prompt.get("template"),
@@ -1787,11 +1841,15 @@ class AgentService:
 
     def submit_batch_generation_job(self, args: dict[str, Any]) -> JobSubmission:
         goal = args.get("goal") or "Generate JUnit 4 tests for all selected Java files."
+        test_name = normalize_test_class_name(args.get("test_name"))
+        test_name_mode = "label" if args.get("test_name_mode") == "label" else "class"
         selected, skipped, meta = self.batch_generation_plan(args)
         parameters = {
             "only_missing": bool(args.get("only_missing", True)),
             "max_files": max(1, min(int(args.get("max_files", 50)), 200)),
             "goal": goal,
+            "test_name": test_name,
+            "test_name_mode": test_name_mode,
         }
         submission = submit_job(
             self.db,
@@ -1799,7 +1857,7 @@ class AgentService:
             kind="batch_test_generation",
             files=selected,
             snapshot_files=self._job_snapshot_scope(selected),
-            request={"goal": goal, "initial_skipped": skipped, **meta},
+            request={"goal": goal, "test_name": test_name, "test_name_mode": test_name_mode, "initial_skipped": skipped, **meta},
             parameters=parameters,
             force=bool(args.get("force", False)),
             client_key=args.get("idempotency_key"),
@@ -2134,7 +2192,7 @@ class AgentService:
         file = self._owned_file(artifact.file_id)
         code = Path(artifact.storage_path).read_text(encoding="utf-8", errors="replace")
         compile_log = args.get("compile_log", "")
-        findings = static_artifact_diagnosis(file.analysis, code, compile_log)
+        findings = static_artifact_diagnosis(file.analysis, code, compile_log, Path(artifact.storage_path).stem)
         return {
             "ok": True,
             "tool": "diagnose_artifact",
@@ -2152,7 +2210,7 @@ class AgentService:
         instruction = args.get("instruction") or "Repair the generated JUnit 4 test so it is more likely to compile."
         coverage_feedback = args.get("coverage") if isinstance(args.get("coverage"), dict) else None
         repair_objective = "coverage_improvement" if coverage_feedback else "compile_or_runtime_repair"
-        diagnosis = static_artifact_diagnosis(file.analysis, current_code, compile_log)
+        diagnosis = static_artifact_diagnosis(file.analysis, current_code, compile_log, Path(artifact.storage_path).stem)
         model_used = ""
         prompt = ""
         rendered_prompt: dict[str, Any] = {}

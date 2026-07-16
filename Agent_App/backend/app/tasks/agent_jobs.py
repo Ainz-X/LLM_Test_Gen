@@ -74,7 +74,12 @@ def batch_generate_tests_task(job_id: str) -> dict[str, Any]:
             )
             try:
                 result = service.tool_generate_tests(
-                    {"file_id": row.id, "goal": request.get("goal")},
+                    {
+                        "file_id": row.id,
+                        "goal": request.get("goal"),
+                        "test_name": request.get("test_name"),
+                        "test_name_mode": request.get("test_name_mode"),
+                    },
                     cancel_check=lambda: cancelled(db, job),
                 )
                 if result.get("ok"):
