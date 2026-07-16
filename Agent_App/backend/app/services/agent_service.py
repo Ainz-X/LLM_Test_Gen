@@ -661,6 +661,25 @@ def high_confidence_fallback_intent(
 
     ask_words = ("?", "？", "为什么", "怎么", "如何", "是否", "可否", "能不能", "可以吗", "有必要")
     run_words = ("run", "execute", "运行", "执行", "跑一下", "跑")
+    coverage_measurement_words = (
+        *run_words,
+        "measure",
+        "calculate",
+        "collect",
+        "refresh",
+        "show coverage",
+        "display coverage",
+        "current coverage",
+        "测量",
+        "统计",
+        "计算",
+        "获取",
+        "展示",
+        "显示",
+        "查看",
+        "刷新",
+        "重新测",
+    )
     generate_words = ("generate", "create", "write", "生成", "创建", "写")
     test_words = ("test", "junit", "测试", "单测")
     batch_words = ("all", "batch", "project", "missing", "所有", "全部", "批量", "整个项目", "全项目", "未生成", "未测试", "未测")
@@ -708,7 +727,8 @@ def high_confidence_fallback_intent(
     if contains_any(lower, coverage_words) and contains_any(lower, coverage_repair_words) and not is_question:
         return "repair_low_coverage", "act", "active_file" if has_active_file else "conversation"
     if contains_any(lower, coverage_words):
-        if not contains_any(lower, run_words) or is_question:
+        # A question mark does not make an explicit coverage measurement request read-only.
+        if not contains_any(lower, coverage_measurement_words):
             return "chat", "ask", "conversation"
         if selected_count > 1 or contains_any(lower, batch_words) or "已生成测试" in lower:
             return "run_batch_coverage", "act", "all_artifacts" if selected_count == 0 else "selected_files"
@@ -761,7 +781,29 @@ def normalize_user_request(
     generate_tokens = ["generate", "create", "write", "生成", "创建", "写"]
     batch_tokens = ["all", "batch", "missing", "project", "批量", "所有", "全部", "项目", "未生成", "未测试", "未测"]
     test_tokens = ["test", "junit", "测试", "未测"]
-    run_tokens = ["run", "execute", "运行", "执行", "跑"]
+    run_tokens = [
+        "run",
+        "execute",
+        "measure",
+        "calculate",
+        "collect",
+        "refresh",
+        "show coverage",
+        "display coverage",
+        "current coverage",
+        "运行",
+        "执行",
+        "跑",
+        "测量",
+        "统计",
+        "计算",
+        "获取",
+        "展示",
+        "显示",
+        "查看",
+        "刷新",
+        "重新测",
+    ]
     diagnose_tokens = ["diagnose", "check", "诊断", "检查", "编译一下", "跑一下"]
     file_info_tokens = [
         "fqn",
@@ -882,7 +924,7 @@ def normalize_user_request(
         intent = "repair_low_coverage"
         mode = "act"
     elif wants_coverage:
-        if wants_run and not is_question:
+        if wants_run:
             intent = "run_coverage"
             mode = "act"
         else:
@@ -2992,18 +3034,12 @@ class AgentService:
                 results.append(result)
                 reply = str(result.get("summary") or "已读取最新测试产物，但未能生成摘要。")
         elif file_id and normalized["intent"] in {"run_coverage", "run_single_coverage"}:
-            latest = self.latest_artifact_for_file(file_id)
-            if latest is None:
-                results.append(self.tool_list_artifacts({"file_id": file_id}))
-                reply = "当前文件还没有生成过测试产物。请先生成测试，再运行覆盖率。"
+            coverage_job = self.tool_start_coverage_job({"file_ids": [file_id], "max_files": 1})
+            results.append(coverage_job)
+            if coverage_job.get("ok"):
+                reply = "已提交当前文件的 JaCoCo 覆盖率任务，完成后会在任务中心显示覆盖率指标和失败原因。"
             else:
-                coverage_result = self.tool_run_coverage({"artifact_id": latest.id})
-                results.append(coverage_result)
-                self.remember_coverage_outcome(conversation_id, file_id, coverage_result)
-                if coverage_result.get("ok"):
-                    reply = coverage_summary_text(coverage_result.get("coverage"))
-                else:
-                    reply = "覆盖率没有跑成：" + concise_failure_reason(coverage_result)
+                reply = "无法提交 JaCoCo 覆盖率任务：" + concise_failure_reason(coverage_job)
         elif normalized["intent"] in {"run_coverage", "run_single_coverage", "run_batch_coverage"}:
             results.append(self.tool_list_artifacts({"limit": 20}))
             reply = (
