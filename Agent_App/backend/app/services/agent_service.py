@@ -122,6 +122,37 @@ def artifact_summary(artifact: GeneratedArtifact) -> dict[str, Any]:
     }
 
 
+def model_usage_summary(usage: Any) -> dict[str, Any]:
+    """Normalize provider usage without assuming every OpenAI-compatible API returns it."""
+    def value(*names: str) -> int:
+        for name in names:
+            raw = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+            if raw is not None:
+                try:
+                    return max(0, int(raw))
+                except (TypeError, ValueError):
+                    continue
+        return 0
+
+    prompt_tokens = value("prompt_tokens", "input_tokens")
+    completion_tokens = value("completion_tokens", "output_tokens")
+    total_tokens = value("total_tokens") or prompt_tokens + completion_tokens
+    input_rate = settings.model_input_cost_per_million_usd
+    output_rate = settings.model_output_cost_per_million_usd
+    pricing_configured = input_rate > 0 or output_rate > 0
+    estimated_cost = None
+    if usage is not None and pricing_configured:
+        estimated_cost = round((prompt_tokens * input_rate + completion_tokens * output_rate) / 1_000_000, 8)
+    return {
+        "provider_reported": usage is not None,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "pricing_configured": pricing_configured,
+        "estimated_cost_usd": estimated_cost,
+    }
+
+
 def tool_call_key(name: str, args: dict[str, Any]) -> str:
     return f"{name}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
 
@@ -1601,6 +1632,7 @@ class AgentService:
         source = Path(file.storage_path).read_text(encoding="utf-8", errors="replace")
         goal = args.get("goal") or "Generate JUnit 4 tests with edge cases and exception paths."
         model_used = ""
+        model_usage: dict[str, Any] = model_usage_summary(None)
         prompt = ""
         rendered_prompt: dict[str, Any] = {}
         code_context = build_code_context(file, db=self.db, max_methods=8, max_field_chars=5000)
@@ -1618,6 +1650,7 @@ class AgentService:
                 ]
                 if cancel_check:
                     parts: list[str] = []
+                    stream_usage: Any = None
                     stream = client.chat.completions.create(
                         model=settings.openai_model,
                         messages=messages,
@@ -1625,6 +1658,8 @@ class AgentService:
                         stream=True,
                     )
                     for chunk in stream:
+                        if getattr(chunk, "usage", None) is not None:
+                            stream_usage = chunk.usage
                         if cancel_check():
                             close_stream = getattr(stream, "close", None)
                             if callable(close_stream):
@@ -1636,6 +1671,7 @@ class AgentService:
                         if text:
                             parts.append(text)
                     code = extract_java("".join(parts))
+                    model_usage = model_usage_summary(stream_usage)
                 else:
                     response = client.chat.completions.create(
                         model=settings.openai_model,
@@ -1643,6 +1679,7 @@ class AgentService:
                         temperature=0.2,
                     )
                     code = extract_java(response.choices[0].message.content or "")
+                    model_usage = model_usage_summary(getattr(response, "usage", None))
                 if not code.strip():
                     raise ValueError("model returned empty test code")
                 model_used = settings.openai_model
@@ -1688,6 +1725,7 @@ class AgentService:
                 "prompt_hash": rendered_prompt.get("hash"),
                 "context_source": code_context.get("context_source"),
                 "context_available_fields": code_context.get("available_fields", []),
+                "model_usage": model_usage,
             },
         )
         self.db.add(artifact)
@@ -2212,6 +2250,7 @@ class AgentService:
         repair_objective = "coverage_improvement" if coverage_feedback else "compile_or_runtime_repair"
         diagnosis = static_artifact_diagnosis(file.analysis, current_code, compile_log, Path(artifact.storage_path).stem)
         model_used = ""
+        model_usage: dict[str, Any] = model_usage_summary(None)
         prompt = ""
         rendered_prompt: dict[str, Any] = {}
         code_context = build_code_context(file, db=self.db, max_methods=8, max_field_chars=5000)
@@ -2238,6 +2277,7 @@ class AgentService:
                     temperature=0.15,
                 )
                 repaired_code = extract_java(response.choices[0].message.content or "")
+                model_usage = model_usage_summary(getattr(response, "usage", None))
                 if not repaired_code.strip():
                     repaired_code = deterministic_repair(file.analysis, current_code)
                     diagnosis.append({"code": "empty_llm_repair", "message": "LLM returned empty repair; deterministic repair used."})
@@ -2285,6 +2325,7 @@ class AgentService:
                 "prompt_hash": rendered_prompt.get("hash"),
                 "context_source": code_context.get("context_source"),
                 "context_available_fields": code_context.get("available_fields", []),
+                "model_usage": model_usage,
             },
         )
         self.db.add(repaired)

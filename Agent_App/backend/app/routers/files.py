@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import io
 import json
 import time
 import uuid
 import zipfile
+from collections import Counter
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import anyio
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, UploadFile
@@ -15,7 +17,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.models import AgentJob, CodeContext, Conversation, GeneratedArtifact, UploadedFile, User
 from app.schemas import (
     AgentJobOut,
@@ -76,6 +78,59 @@ def job_payload(job: AgentJob) -> dict[str, object]:
         "started_at": job.started_at,
         "finished_at": job.finished_at,
     }
+
+
+def job_duration_seconds(job: AgentJob) -> float | None:
+    if job.started_at is None or job.finished_at is None:
+        return None
+    return max(0.0, (job.finished_at - job.started_at).total_seconds())
+
+
+def coverage_line_percent(value: Any, depth: int = 0) -> float | None:
+    """Find JaCoCo's target line percentage in compact or full task results."""
+    if depth > 10:
+        return None
+    if isinstance(value, dict):
+        line = value.get("line")
+        if isinstance(line, dict):
+            percent = line.get("percent")
+            if isinstance(percent, (int, float)):
+                return max(0.0, min(100.0, float(percent)))
+        for key in ("target", "coverage", "result", "reports", "total", "data"):
+            if key in value:
+                percent = coverage_line_percent(value[key], depth + 1)
+                if percent is not None:
+                    return percent
+        for nested in value.values():
+            percent = coverage_line_percent(nested, depth + 1)
+            if percent is not None:
+                return percent
+    if isinstance(value, list):
+        values = [coverage_line_percent(item, depth + 1) for item in value]
+        found = [item for item in values if item is not None]
+        return sum(found) / len(found) if found else None
+    return None
+
+
+def worker_health() -> dict[str, Any]:
+    checked_at = dt.datetime.utcnow().isoformat() + "Z"
+    try:
+        from app.celery_worker import celery_app
+
+        replies = celery_app.control.inspect(timeout=1.5).ping() or {}
+        workers = sorted(replies.keys())
+        return {
+            "status": "healthy" if workers else "unavailable",
+            "workers": workers,
+            "checked_at": checked_at,
+        }
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "workers": [],
+            "checked_at": checked_at,
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def safe_name(name: str) -> str:
@@ -857,6 +912,77 @@ def list_jobs(
     )
 
 
+@router.get("/observability")
+def observability_summary(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    jobs = (
+        db.query(AgentJob)
+        .filter(AgentJob.user_id == user.id)
+        .order_by(AgentJob.updated_at.desc())
+        .limit(120)
+        .all()
+    )
+    terminal_statuses = {"succeeded", "failed", "cancelled"}
+    terminal_durations = [duration for job in jobs if job.status in terminal_statuses if (duration := job_duration_seconds(job)) is not None]
+    failure_stages: Counter[str] = Counter()
+    for job in jobs:
+        if job.status == "failed":
+            failure_stages[job.stage or "unknown"] += 1
+        job_result = job.result_json or {}
+        for item in job_result.get("failed", []) if isinstance(job_result, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            detail = item.get("result") if isinstance(item.get("result"), dict) else item
+            failure_stages[str(detail.get("stage") or job.stage or "unknown")] += 1
+    coverage_points: list[dict[str, Any]] = []
+    for job in reversed(jobs):
+        if job.kind != "batch_coverage" or job.status != "succeeded":
+            continue
+        percent = coverage_line_percent(job.result_json or {})
+        if percent is not None:
+            coverage_points.append({"at": job.finished_at or job.updated_at, "line_percent": round(percent, 1)})
+    artifacts = (
+        db.query(GeneratedArtifact)
+        .filter(GeneratedArtifact.user_id == user.id, GeneratedArtifact.model != "")
+        .order_by(GeneratedArtifact.created_at.desc())
+        .limit(500)
+        .all()
+    )
+    usage_rows = [
+        metadata.get("model_usage")
+        for artifact in artifacts
+        if isinstance((metadata := artifact.metadata_json or {}), dict) and isinstance(metadata.get("model_usage"), dict)
+    ]
+    metered_usage_rows = [item for item in usage_rows if item.get("provider_reported") is True]
+    prompt_tokens = sum(int(item.get("prompt_tokens") or 0) for item in metered_usage_rows)
+    completion_tokens = sum(int(item.get("completion_tokens") or 0) for item in metered_usage_rows)
+    costs = [item.get("estimated_cost_usd") for item in metered_usage_rows if isinstance(item.get("estimated_cost_usd"), (int, float))]
+    return {
+        "worker": worker_health(),
+        "tasks": {
+            "total": len(jobs),
+            "active": sum(1 for job in jobs if job.status in {"queued", "running"}),
+            "failed": sum(1 for job in jobs if job.status == "failed"),
+            "avg_duration_seconds": round(sum(terminal_durations) / len(terminal_durations), 1) if terminal_durations else None,
+            "latest_duration_seconds": round(terminal_durations[0], 1) if terminal_durations else None,
+        },
+        "model_usage": {
+            "generation_or_repair_calls": len(artifacts),
+            "metered_calls": len(metered_usage_rows),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "estimated_cost_usd": round(sum(float(item) for item in costs), 8) if costs else None,
+            "pricing_configured": settings.model_input_cost_per_million_usd > 0 or settings.model_output_cost_per_million_usd > 0,
+            "unmetered_calls": max(0, len(artifacts) - len(metered_usage_rows)),
+        },
+        "failure_stages": [
+            {"stage": stage, "count": count}
+            for stage, count in failure_stages.most_common(6)
+        ],
+        "coverage_trend": coverage_points[-12:],
+    }
+
+
 @router.get("/jobs/{job_id}", response_model=AgentJobOut)
 def get_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     job = db.get(AgentJob, job_id)
@@ -884,6 +1010,7 @@ def stream_job(job_id: str, request: Request, db: Session = Depends(get_db), use
     job = db.get(AgentJob, job_id)
     if not job or job.user_id != user.id:
         raise HTTPException(status_code=404, detail="Job not found")
+    user_id = user.id
 
     def client_disconnected() -> bool:
         try:
@@ -893,16 +1020,28 @@ def stream_job(job_id: str, request: Request, db: Session = Depends(get_db), use
 
     def generate():
         terminal = {"succeeded", "failed", "cancelled"}
-        while True:
-            db.refresh(job)
-            payload = job_payload(job)
-            yield sse("progress", payload)
-            if job.status in terminal:
-                yield sse("done", payload)
-                return
-            if client_disconnected():
-                return
-            time.sleep(1)
+        # FastAPI closes request-scoped dependencies before a sync streaming
+        # generator is consumed. Keep a dedicated session for this SSE stream.
+        stream_db = SessionLocal()
+        try:
+            while True:
+                stream_db.expire_all()
+                current = stream_db.get(AgentJob, job_id)
+                if current is None or current.user_id != user_id:
+                    yield sse("error", {"detail": "Task record is no longer available."})
+                    return
+                payload = job_payload(current)
+                yield sse("progress", payload)
+                if current.status in terminal:
+                    yield sse("done", payload)
+                    return
+                if client_disconnected():
+                    return
+                time.sleep(1)
+        except Exception as exc:
+            yield sse("error", {"detail": f"Task status stream failed: {type(exc).__name__}: {exc}"})
+        finally:
+            stream_db.close()
 
     return StreamingResponse(
         generate(),

@@ -28,6 +28,10 @@ class Settings:
     openai_api_key = os.getenv("OPENAI_API_KEY", "")
     openai_base_url = os.getenv("OPENAI_BASE_URL", "")
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    # Pricing is deployment-specific. Keep it opt-in so the UI never presents
+    # a made-up provider cost when the model endpoint does not expose pricing.
+    model_input_cost_per_million_usd = float(os.getenv("MODEL_INPUT_COST_PER_MILLION_USD", "0"))
+    model_output_cost_per_million_usd = float(os.getenv("MODEL_OUTPUT_COST_PER_MILLION_USD", "0"))
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
     celery_broker_url = os.getenv("CELERY_BROKER_URL", redis_url)
     celery_result_backend = os.getenv("CELERY_RESULT_BACKEND", redis_url)
